@@ -1,0 +1,10 @@
+auto_run_signal
+ready_timestamp
+flow_stage
+flow_count
+passenger_count
+avg_ride_time
+avg_wait_time
+flags_le16
+n_records
+n_events

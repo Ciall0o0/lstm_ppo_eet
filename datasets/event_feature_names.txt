@@ -1,0 +1,10 @@
+source_floor
+dest_floor
+event_time
+arrival_time
+duration
+direction
+position
+time_delta
+floor_delta
+total_floors

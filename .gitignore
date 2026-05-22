@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+1早高峰
+2晚高峰
+6会议活动突发流
+3午间双向交叉峰
+4层间交互客流
+5极端闲时
+requirement
