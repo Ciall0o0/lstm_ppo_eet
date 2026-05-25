@@ -16,43 +16,63 @@ env:
   dwell_time: 3.0
   idle_timeout: 60.0
   long_wait_threshold: 60.0
-  max_total_time: 1800.0
+  max_total_time: 5400.0
 
 model:
-  state_dim: 93
-  lstm_hidden: 128
+  state_dim: 104
+  lstm_hidden: 256
   lstm_layers: 2
-  lstm_dropout: 0.2
-  actor_hidden: 64
-  critic_hidden: 64
+  lstm_dropout: 0.1
+  actor_hidden: 128
+  critic_hidden: 128
   action_dim: 3
+  # Architecture options
+  encoder_type: "lstm"         # "lstm" or "gru"
+  activation: "relu"           # "relu", "gelu", or "silu"
+  use_head_layernorm: false    # LayerNorm in actor/critic MLP heads
 
 ppo:
-  learning_rate: 3.0e-4
+  learning_rate: 5.0e-4
   gamma: 0.99
   gae_lambda: 0.95
-  clip_epsilon: 0.25
+  clip_epsilon: 0.2
   value_loss_coef: 0.5
-  entropy_coef: 0.02
-  max_grad_norm: 4.0
-  ppo_epochs: 10
-  batch_size: 128
-  rollout_steps: 2048
-  seq_len: 64
+  entropy_coef_start: 0.10
+  entropy_coef_end: 0.03
+  max_grad_norm: 5.0
+  ppo_epochs: 8
+  batch_size: 2048
+  rollout_steps: 16384
+  seq_len: 32
+  weight_decay: 1.0e-4
+  compile_policy: true
+  # AMP mixed precision (GPU only)
+  use_amp: false
+  # KL early stopping (stops PPO epochs early if KL exceeds target)
+  kl_early_stop: true
+  kl_target: 0.01
+  # Advantage normalization
+  normalize_advantage: true
 
 training:
-  total_epochs: 100
-  eval_every: 5
-  early_stop_patience: 20
+  total_epochs: 200
+  eval_every: 10
+  early_stop_patience: 30
   save_dir: "checkpoints"
-  log_interval: 10
+  num_envs: 32
+  # LR warmup
+  warmup_epochs: 5             # linear warmup epochs (0 to disable)
+  warmup_ratio: 0.1            # initial LR = lr * warmup_ratio
+  # Resume from checkpoint (set to path or leave empty)
+  resume_checkpoint: ""
 
 reward:
-  passenger_delivered: 5.0
-  wait_time_per_sec: -0.1
-  empty_distance_per_floor: -0.15
-  energy_per_start_stop: -0.05
-  idle_penalty_per_sec: -0.02
+  passenger_delivered: 50.0
+  wait_time_per_sec: -0.01
+  empty_distance_per_floor: -0.02
+  energy_per_start_stop: -0.01
+  idle_penalty_per_sec: -0.005
+  assignment_dist_per_floor: -1.0
 
 plc:
   ip: "192.168.0.1"

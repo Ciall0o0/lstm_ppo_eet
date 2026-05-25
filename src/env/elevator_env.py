@@ -101,6 +101,7 @@ class Elevator:
 
     def assign_call(self, pickup_floor: int, dest_floor: int, passenger_id: int):
         """Assign a passenger call to this elevator."""
+        self.car_calls.add(pickup_floor)
         self.car_calls.add(dest_floor)
         p = {"id": passenger_id, "pickup": pickup_floor, "dest": dest_floor,
              "arrive_time": None, "boarded": False}
@@ -147,11 +148,12 @@ class Elevator:
 
     def to_vector(self) -> np.ndarray:
         """Encode elevator state as fixed-length vector."""
-        out = np.empty(MAX_FLOOR + 3 + 4, dtype=np.float32)
+        out = np.empty(MAX_FLOOR + 3 + 7, dtype=np.float32)
         self._write_to_buffer(out, 0)
         return out
 
-    def _write_to_buffer(self, out: np.ndarray, offset: int) -> int:
+    def _write_to_buffer(self, out: np.ndarray, offset: int,
+                         dist_to_oldest: float = 0.0) -> int:
         """Write elevator state into out[offset:] and return new offset."""
         f = int(round(self.current_floor))
         out[offset:offset + MAX_FLOOR] = 0.0
@@ -163,10 +165,16 @@ class Elevator:
         out[offset + self.direction + 1] = 1.0
         offset += 3
 
-        out[offset] = self.load_ratio; offset += 1
-        out[offset] = 1.0 if self.is_moving else 0.0; offset += 1
+        # Inline property lookups (hot path: called per-env per-step)
+        lr = min(self.load_kg / self.max_load, 1.0)
+        out[offset] = lr; offset += 1
+        out[offset] = 1.0 if self.state == "moving" else 0.0; offset += 1
         out[offset] = 1.0 if self.state == "doors_open" else 0.0; offset += 1
         out[offset] = 1.0 if self.car_calls else 0.0; offset += 1
+        max_pax = int(self.max_load / 75.0)
+        out[offset] = min(len(self.assigned_passengers) / max(max_pax, 1), 1.0); offset += 1
+        out[offset] = self.target_floor / MAX_FLOOR; offset += 1
+        out[offset] = dist_to_oldest; offset += 1
 
         return offset
 
@@ -186,12 +194,12 @@ class ElevatorEnv(gym.Env):
         self.door_close_time = cfg.get("door_close_time", 2.5)
         self.dwell_time = cfg.get("dwell_time", 3.0)
         self.long_wait_threshold = cfg.get("long_wait_threshold", 60.0)
-        self.max_total_time = cfg.get("max_total_time", 3600.0)  # 1 hour cap
+        self.max_total_time = cfg.get("max_total_time", 3600.0)
 
         self.observation_space = spaces.Box(
             low=-1.0, high=10.0, shape=(self.state_dim,), dtype=np.float32
         )
-        self.action_space = spaces.Discrete(self.num_elevators)
+        self.action_space: spaces.Discrete = spaces.Discrete(self.num_elevators)
 
         # Pre-allocated buffer for observation construction
         self._obs_buffer = np.empty(self.state_dim, dtype=np.float32)
@@ -209,6 +217,11 @@ class ElevatorEnv(gym.Env):
         self.floors_down_calls: set[int] = set()
         self.completed_passengers: list[dict] = []
 
+        # Sanity: computed state dim must match actual encoding size
+        test_obs = self._get_obs()
+        assert test_obs.shape[0] == self.state_dim, \
+            f"State dim computed={self.state_dim} != actual={test_obs.shape[0]}"
+
         # Stats
         self.total_empty_floors: float = 0.0
         self.total_loaded_floors: float = 0.0
@@ -221,9 +234,13 @@ class ElevatorEnv(gym.Env):
         self.r_empty_floor = cfg.get("empty_distance_per_floor", -0.1)
         self.r_start_stop = cfg.get("energy_per_start_stop", -0.05)
         self.r_idle_sec = cfg.get("idle_penalty_per_sec", 0.0)
+        self.r_assign_dist = cfg.get("assignment_dist_per_floor", -1.0)
 
         self._event_wait_buffers: dict[int, float] = {}  # passenger_id → arrival_time
         self._passenger_arrival_times: dict[int, float] = {}  # passenger_id → time entered pending_calls
+
+        # Event-level features for observation (computed per injected event)
+        self._last_event_time: float = 0.0
 
     def _init_elevators(self):
         self.elevators = [
@@ -250,6 +267,7 @@ class ElevatorEnv(gym.Env):
         self.floors_down_calls.clear()
         self.completed_passengers.clear()
         self._event_wait_buffers.clear()
+        self._last_event_time = 0.0
 
         self.total_empty_floors = 0.0
         self.total_loaded_floors = 0.0
@@ -264,7 +282,7 @@ class ElevatorEnv(gym.Env):
             t_min = float(raw_times.min())
             t_max = float(raw_times.max())
             if t_max - t_min > 1e-6:
-                scale = 3600.0 / (t_max - t_min)
+                scale = (self.max_total_time * 0.9) / (t_max - t_min)
                 events[:, 2] = (raw_times - t_min) * scale
             else:
                 events[:, 2] = 0.0
@@ -290,6 +308,9 @@ class ElevatorEnv(gym.Env):
         if self.pending_calls and 0 <= action < self.num_elevators:
             call = self.pending_calls.popleft()
             elevator = self.elevators[action]
+            # Immediate assignment-quality reward: penalty for distance to pickup
+            dist = abs(elevator.current_floor - call["floor"])
+            reward += self.r_assign_dist * dist
             elevator.assign_call(call["floor"], call["dest"], call["passenger_id"])
             # Wait clock starts from passenger's true arrival, not assignment time
             self._event_wait_buffers[call["passenger_id"]] = call["arrival_time"]
@@ -390,6 +411,19 @@ class ElevatorEnv(gym.Env):
                 break
             src = max(1, min(MAX_FLOOR, int(ev[0])))
             dst = max(1, min(MAX_FLOOR, int(ev[1])))
+
+            # Compute time_delta from consecutive normalized event times
+            if self._last_event_time > 0:
+                time_delta = et - self._last_event_time
+            else:
+                time_delta = 0.0
+            self._last_event_time = et
+
+            # Read floor_delta from col 8, replace -1 sentinel with 0
+            fd_raw = float(ev[8])
+            if fd_raw < -0.5:  # -1.0 sentinel for first event
+                fd_raw = 0.0
+
             if src != dst:
                 direction = 1 if dst > src else -1
                 pid = self.passenger_id_counter
@@ -398,6 +432,8 @@ class ElevatorEnv(gym.Env):
                     "floor": src, "dest": dst, "direction": direction,
                     "passenger_id": pid,
                     "arrival_time": self.elapsed,  # record true arrival time
+                    "time_delta": time_delta,
+                    "floor_delta": fd_raw,
                 })
                 if direction == 1:
                     self.floors_up_calls.add(src)
@@ -406,41 +442,54 @@ class ElevatorEnv(gym.Env):
             self.event_idx += 1
 
     def _get_obs(self) -> np.ndarray:
+        oldest_floor = self.pending_calls[0]["floor"] if self.pending_calls else None
+
         offset = 0
         for el in self.elevators:
-            offset = el._write_to_buffer(self._obs_buffer, offset)
+            if oldest_floor is not None:
+                dist_oldest = abs(el.current_floor - oldest_floor) / MAX_FLOOR
+            else:
+                dist_oldest = 0.0
+            offset = el._write_to_buffer(self._obs_buffer, offset,
+                                         dist_to_oldest=dist_oldest)
 
-        # up calls one-hot
-        self._obs_buffer[offset:offset + MAX_FLOOR] = 0.0
+        # up calls + down calls one-hot (zeroed together — adjacent blocks)
+        self._obs_buffer[offset:offset + MAX_FLOOR * 2] = 0.0
         for f in self.floors_up_calls:
             if 1 <= f <= MAX_FLOOR:
                 self._obs_buffer[offset + f - 1] = 1.0
-        offset += MAX_FLOOR
-
-        # down calls one-hot
-        self._obs_buffer[offset:offset + MAX_FLOOR] = 0.0
         for f in self.floors_down_calls:
             if 1 <= f <= MAX_FLOOR:
-                self._obs_buffer[offset + f - 1] = 1.0
-        offset += MAX_FLOOR
+                self._obs_buffer[offset + MAX_FLOOR + f - 1] = 1.0
+        offset += MAX_FLOOR * 2
 
-        # up-call destinations one-hot (which floors are up-call passengers going to)
-        self._obs_buffer[offset:offset + MAX_FLOOR] = 0.0
+        # up-call destinations + down-call destinations (single pass over pending_calls)
+        up_dest_start = offset
+        self._obs_buffer[offset:offset + MAX_FLOOR * 2] = 0.0
         for c in self.pending_calls:
-            if c["direction"] == 1 and 1 <= c["dest"] <= MAX_FLOOR:
-                self._obs_buffer[offset + int(c["dest"]) - 1] = 1.0
-        offset += MAX_FLOOR
-
-        # down-call destinations one-hot
-        self._obs_buffer[offset:offset + MAX_FLOOR] = 0.0
-        for c in self.pending_calls:
-            if c["direction"] == -1 and 1 <= c["dest"] <= MAX_FLOOR:
-                self._obs_buffer[offset + int(c["dest"]) - 1] = 1.0
-        offset += MAX_FLOOR
+            d = int(c["dest"])
+            if 1 <= d <= MAX_FLOOR:
+                if c["direction"] == 1:
+                    self._obs_buffer[up_dest_start + d - 1] = 1.0
+                else:
+                    self._obs_buffer[up_dest_start + MAX_FLOOR + d - 1] = 1.0
+        offset += MAX_FLOOR * 2
 
         # global features
-        self._obs_buffer[offset] = min(self.elapsed / 3600.0, 1.0); offset += 1
-        self._obs_buffer[offset] = min(len(self.pending_calls) / 30.0, 1.0)
+        max_time = max(self.max_total_time, 1.0)
+        self._obs_buffer[offset] = min(self.elapsed / max_time, 1.0); offset += 1
+        self._obs_buffer[offset] = min(len(self.pending_calls) / 30.0, 1.0); offset += 1
+
+        # Event-level features from oldest pending call
+        if self.pending_calls:
+            oldest = self.pending_calls[0]
+            td = max(-60.0, min(300.0, oldest.get("time_delta", 0.0)))
+            self._obs_buffer[offset] = (td + 60.0) / 360.0; offset += 1
+            fd = max(-MAX_FLOOR, min(MAX_FLOOR, oldest.get("floor_delta", 0.0)))
+            self._obs_buffer[offset] = fd / MAX_FLOOR; offset += 1
+        else:
+            self._obs_buffer[offset] = 0.0; offset += 1
+            self._obs_buffer[offset] = 0.0; offset += 1
 
         return self._obs_buffer
 
@@ -469,7 +518,7 @@ class ElevatorEnv(gym.Env):
 
     @staticmethod
     def _compute_state_dim(num_elevators: int) -> int:
-        return (MAX_FLOOR + 3 + 1 + 1 + 1 + 1) * num_elevators + MAX_FLOOR * 4 + 2
+        return (MAX_FLOOR + 3 + 7) * num_elevators + MAX_FLOOR * 4 + 2 + 2
 
     @property
     def STATE_DIM(self) -> int:
