@@ -8,7 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-
+.claude
 1早高峰
 2晚高峰
 6会议活动突发流
