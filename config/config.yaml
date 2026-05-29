@@ -41,8 +41,8 @@ ppo:
   entropy_coef_end: 0.03
   max_grad_norm: 5.0
   ppo_epochs: 8
-  batch_size: 2048
-  rollout_steps: 16384
+  batch_size: 8192
+  rollout_steps: 32768
   seq_len: 32
   weight_decay: 1.0e-4
   compile_policy: true
@@ -71,7 +71,9 @@ reward:
   wait_time_per_sec: -0.01
   empty_distance_per_floor: -0.02
   energy_per_start_stop: -0.01
-  idle_penalty_per_sec: -0.005
+  idle_penalty_per_sec: -0.02
+  idle_center_bonus: 0.005
+  idle_spread_penalty: -0.01
   assignment_dist_per_floor: -1.0
 
 plc:
