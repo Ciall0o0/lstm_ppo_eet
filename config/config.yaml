@@ -28,8 +28,8 @@ model:
   critic_hidden: 128
   action_dim: 3
   activation: "relu"           # "relu", "gelu", or "silu"
-  actor_dropout: 0.1
-  critic_dropout: 0.1
+  actor_dropout: 0.05
+  critic_dropout: 0.05
   use_layer_norm: true
 
 ppo:
@@ -72,9 +72,9 @@ reward:
   wait_time_per_sec: -0.01        # per-passenger per-second wait penalty
   empty_distance_per_floor: -0.05 # penalty for empty repositioning
   energy_per_start_stop: -0.02    # energy cost per start/stop
-  idle_penalty_per_sec: -0.02     # increased from -0.005 (4x stronger)
-  idle_center_bonus: 0.005        # per-second bonus for idle elevators near center
-  idle_spread_penalty: -0.01      # per-second penalty per additional idle elevator on same floor
+  idle_penalty_per_sec: -0.01     # 2x stronger than original -0.005
+  idle_center_bonus: 0.0          # disabled — caused conflicting signals
+  idle_spread_penalty: 0.0        # disabled — too aggressive for now
   assignment_dist_per_floor: -0.3 # penalty for assigning to distant elevator
   # Reward normalization: batch-level in PPOTrainer (not per-env)
   normalize: false
