@@ -16,7 +16,35 @@ from .metrics import compute_episode_metrics
 MAX_FLOOR = 10
 
 
-@dataclass
+class RewardNormalizer:
+    """Running reward normalizer using Welford's online algorithm."""
+
+    def __init__(self, clip_range: float = 5.0):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 1e-8
+        self.clip_range = clip_range
+
+    def update(self, reward: float) -> float:
+        self.count += 1
+        delta = reward - self.mean
+        self.mean += delta / self.count
+        delta2 = reward - self.mean
+        self.var += (delta * delta2 - self.var) / self.count
+        std = max(self.var ** 0.5, 1e-8)
+        normalized = (reward - self.mean) / std
+        return float(np.clip(normalized, -self.clip_range, self.clip_range))
+
+    def state_dict(self) -> dict:
+        return {"mean": self.mean, "var": self.var, "count": self.count}
+
+    def load_state_dict(self, d: dict):
+        self.mean = d["mean"]
+        self.var = d["var"]
+        self.count = d["count"]
+
+
+@dataclass(slots=True)
 class Elevator:
     id: int
     current_floor: float = 1.0
@@ -216,6 +244,7 @@ class ElevatorEnv(gym.Env):
         self.floors_up_calls: set[int] = set()
         self.floors_down_calls: set[int] = set()
         self.completed_passengers: list[dict] = []
+        self._any_elevators_active: bool = False
 
         # Sanity: computed state dim must match actual encoding size
         test_obs = self._get_obs()
@@ -235,6 +264,16 @@ class ElevatorEnv(gym.Env):
         self.r_start_stop = cfg.get("energy_per_start_stop", -0.05)
         self.r_idle_sec = cfg.get("idle_penalty_per_sec", 0.0)
         self.r_assign_dist = cfg.get("assignment_dist_per_floor", -1.0)
+        self.r_idle_center = cfg.get("idle_center_bonus", 0.0)
+        self.r_idle_spread = cfg.get("idle_spread_penalty", 0.0)
+
+        # Reward normalization (shared across episodes, passed from outside)
+        normalize = cfg.get("normalize", False)
+        clip_range = cfg.get("clip_range", 5.0)
+        if normalize:
+            self.reward_normalizer = RewardNormalizer(clip_range=clip_range)
+        else:
+            self.reward_normalizer = None
 
         self._event_wait_buffers: dict[int, float] = {}  # passenger_id → arrival_time
         self._passenger_arrival_times: dict[int, float] = {}  # passenger_id → time entered pending_calls
@@ -268,11 +307,13 @@ class ElevatorEnv(gym.Env):
         self.completed_passengers.clear()
         self._event_wait_buffers.clear()
         self._last_event_time = 0.0
+        self._any_elevators_active = False
 
         self.total_empty_floors = 0.0
         self.total_loaded_floors = 0.0
         self.start_stop_count = 0
         self.elevator_active_time = 0.0
+        self.idle_cluster_steps = 0
 
         # Normalize event times: shift to start at 0, scale to max 3600s
         if self.events is not None and len(self.events) > 0:
@@ -327,11 +368,17 @@ class ElevatorEnv(gym.Env):
 
         # --- Advance simulation by dt ---
         if dt > 0:
-            prev_positions = [el.current_floor for el in self.elevators]
-            prev_states = [el.state for el in self.elevators]
+            elevators = self.elevators
+            n_el = self.num_elevators
 
-            for el in self.elevators:
-                delivered = el.step(dt)
+            prev_positions = [0.0] * n_el
+            prev_states = [""] * n_el
+            for i in range(n_el):
+                prev_positions[i] = elevators[i].current_floor
+                prev_states[i] = elevators[i].state
+
+            for i in range(n_el):
+                delivered = elevators[i].step(dt)
                 for p in delivered:
                     wait_time = self.elapsed + dt - self._event_wait_buffers.pop(p["id"], self.elapsed + dt)
                     self.completed_passengers.append({
@@ -339,11 +386,16 @@ class ElevatorEnv(gym.Env):
                         "wait_time": wait_time,
                         "ride_time": abs(p["dest"] - p["pickup"]) * self.floor_travel_time,
                     })
-                    reward += self.r_passenger
+                    # Time-decaying delivery reward: full reward for instant delivery,
+                    # linear decay to 0 at long_wait_threshold
+                    wait_ratio = min(wait_time / self.long_wait_threshold, 1.0)
+                    reward += self.r_passenger * (1.0 - wait_ratio)
 
             self.elapsed += dt
 
-            for i, el in enumerate(self.elevators):
+            any_active = False
+            for i in range(n_el):
+                el = elevators[i]
                 if el.is_moving:
                     dist = abs(el.current_floor - prev_positions[i])
                     if el.load_ratio > 0.05:
@@ -358,15 +410,40 @@ class ElevatorEnv(gym.Env):
 
                 if el.state != "idle":
                     self.elevator_active_time += dt
+                    any_active = True
+                elif el.assigned_passengers:
+                    any_active = True
 
-            # Penalize waiting passengers (from true arrival time)
-            for arrival in self._event_wait_buffers.values():
-                reward += self.r_wait_sec * dt
+            self._any_elevators_active = any_active
 
-            # Penalize idle elevators
-            for el in self.elevators:
-                if el.state == "idle":
+            # Penalize waiting passengers (O(1) — no dict iteration)
+            n_waiting = len(self._event_wait_buffers)
+            if n_waiting:
+                reward += self.r_wait_sec * n_waiting * dt
+
+            # Penalize idle elevators + center proximity + spread
+            center_floor = (MAX_FLOOR + 1) / 2.0
+            idle_floor_counts: dict[int, int] = {}
+            for i in range(n_el):
+                if elevators[i].state == "idle":
                     reward += self.r_idle_sec * dt
+                    # Center proximity bonus: linear decay from center
+                    dist_from_center = abs(elevators[i].current_floor - center_floor)
+                    center_factor = 1.0 - dist_from_center / (MAX_FLOOR / 2.0)
+                    reward += self.r_idle_center * max(0.0, center_factor) * dt
+                    # Track floor occupancy for spread penalty
+                    f = round(elevators[i].current_floor)
+                    idle_floor_counts[f] = idle_floor_counts.get(f, 0) + 1
+            # Idle spread penalty: discourage clustering on same floor
+            if self.r_idle_spread != 0.0:
+                for count in idle_floor_counts.values():
+                    if count > 1:
+                        reward += self.r_idle_spread * (count - 1) * dt
+            # Track clustering for metrics
+            if idle_floor_counts:
+                max_cluster = max(idle_floor_counts.values())
+                if max_cluster > 1:
+                    self.idle_cluster_steps += 1
 
         # --- Inject new events ---
         if self.events is not None:
@@ -374,6 +451,9 @@ class ElevatorEnv(gym.Env):
 
         done = self._is_done()
         info = self._get_info()
+
+        if self.reward_normalizer is not None:
+            reward = self.reward_normalizer.update(reward)
 
         return self._get_obs(), reward, done, False, info
 
@@ -502,6 +582,7 @@ class ElevatorEnv(gym.Env):
             "total_loaded_floors": self.total_loaded_floors,
             "start_stop_count": self.start_stop_count,
             "elevator_active_time": self.elevator_active_time,
+            "idle_cluster_steps": self.idle_cluster_steps,
         }
 
     def _is_done(self) -> bool:
@@ -511,9 +592,8 @@ class ElevatorEnv(gym.Env):
             return False
         if self.pending_calls:
             return False
-        for el in self.elevators:
-            if el.is_moving or el.assigned_passengers:
-                return False
+        if self._any_elevators_active:
+            return False
         return bool(self.completed_passengers)
 
     @staticmethod
@@ -534,6 +614,7 @@ class ElevatorEnv(gym.Env):
             "elevator_uptime": self.elevator_active_time,
             "elevator_idle_time": max(0, self.elapsed * self.num_elevators - self.elevator_active_time),
             "num_elevators": self.num_elevators,
+            "idle_cluster_steps": self.idle_cluster_steps,
         })
 
 

@@ -1,7 +1,5 @@
 """Elevator scheduling performance metrics."""
 
-import numpy as np
-
 MAX_FLOOR = 10
 FLOOR_HEIGHT = 3.0
 GRAVITY = 9.81
@@ -12,19 +10,19 @@ SPEED_MPS = FLOOR_HEIGHT / 2.0
 def avg_wait_time(wait_times: list) -> float:
     if not wait_times:
         return 0.0
-    return float(np.mean(wait_times))
+    return sum(wait_times) / len(wait_times)
 
 
 def long_wait_rate(wait_times: list, threshold: float = 60.0) -> float:
     if not wait_times:
         return 0.0
-    return float(np.mean(np.array(wait_times) > threshold))
+    return sum(1 for t in wait_times if t > threshold) / len(wait_times)
 
 
 def avg_ride_time(ride_times: list) -> float:
     if not ride_times:
         return 0.0
-    return float(np.mean(ride_times))
+    return sum(ride_times) / len(ride_times)
 
 
 def energy_estimate(
@@ -104,4 +102,19 @@ def compute_episode_metrics(episode_stats: dict) -> dict:
         "energy_kinetic_wh": energy["kinetic_wh"],
         "total_movement_floors": total_movement,
         "start_stop_count": episode_stats.get("start_stop_count", 0),
+        "scheduling_quality": scheduling_quality(
+            avg_wait_time(wait_times), long_wait_rate(wait_times), op_eff
+        ),
+        "idle_cluster_rate": episode_stats.get("idle_cluster_steps", 0) / max(1, int(total_time)),
     }
+
+
+def scheduling_quality(avg_wait: float, long_rate: float, op_eff: float) -> float:
+    """Composite scheduling quality score, higher is better.
+
+    Combines wait time (0.4), long-wait avoidance (0.3), and operational
+    efficiency (0.3), each normalized to [0, 1].
+    """
+    wait_score = max(0.0, 1.0 - avg_wait / 120.0)   # 0 at 120s, 1 at 0s
+    long_score = 1.0 - long_rate                      # 0 if all long, 1 if none
+    return 0.4 * wait_score + 0.3 * long_score + 0.3 * op_eff
