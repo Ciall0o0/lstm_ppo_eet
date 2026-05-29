@@ -12,10 +12,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils import load_config, PROJ_ROOT, get_device, merge_reward_config
-from data.dataset import load_raw_data, split_indices, SCENARIO_NAMES
-from env.elevator_env import ElevatorEnv
-from models.lstm_ppo import PPOTrainer
+from src.utils import load_config, PROJ_ROOT, get_device, merge_reward_config
+from src.data.dataset import load_raw_data, split_indices, SCENARIO_NAMES
+from src.env.elevator_env import ElevatorEnv
+from src.models.lstm_ppo import PPOTrainer
 
 SCENARIO_LABELS = {k: v.replace("_", " ").title() for k, v in SCENARIO_NAMES.items()}
 
@@ -41,60 +41,43 @@ def _run_episode(env, obs, policy, trainer, deterministic: bool = True) -> tuple
     return episode_reward, metrics
 
 
-def _baseline_nearest_car(env_template, events_trimmed):
+def _run_baseline_episode(env_cfg, events_trimmed, action_fn):
+    """Run a baseline episode with a custom action selection function."""
+    env = ElevatorEnv(dict(env_cfg))
+    obs, _ = env.reset(options={"events": events_trimmed})
+    episode_reward = 0.0
+    done = False
+
+    while not done:
+        action = action_fn(env)
+        obs, reward, done, _, _ = env.step(action)
+        episode_reward += reward
+
+    metrics = env.get_episode_metrics()
+    metrics["reward"] = episode_reward
+    return episode_reward, metrics
+
+
+def _baseline_nearest_car(env_cfg, events_trimmed):
     """Nearest-Car baseline: assign pending call to nearest available elevator."""
-    env = ElevatorEnv(env_template.__dict__.copy() if hasattr(env_template, '__dict__') else {})
-    obs, _ = env.reset(options={"events": events_trimmed})
-    episode_reward = 0.0
-    done = False
-
-    while not done:
-        if hasattr(env, 'pending_calls') and env.pending_calls:
-            call = env.pending_calls[0] if len(env.pending_calls) > 0 else None
-            if call:
-                call_floor = call["floor"]
-                best_elevator = 0
-                best_dist = float("inf")
-                for i, el in enumerate(env.elevators):
-                    dist = abs(el.current_floor - call_floor)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_elevator = i
-                action = best_elevator
-            else:
-                action = 0
-        else:
-            action = 0
-
-        obs, reward, done, _, _ = env.step(action)
-        episode_reward += reward
-
-    metrics = env.get_episode_metrics()
-    metrics["reward"] = episode_reward
-    return episode_reward, metrics
+    def _select(env):
+        if not env.pending_calls:
+            return 0
+        call_floor = env.pending_calls[0]["floor"]
+        best = min(range(len(env.elevators)),
+                   key=lambda i: abs(env.elevators[i].current_floor - call_floor))
+        return best
+    return _run_baseline_episode(env_cfg, events_trimmed, _select)
 
 
-def _baseline_random(env_template, events_trimmed):
+def _baseline_random(env_cfg, events_trimmed):
     """Random baseline: assign pending call to a random elevator."""
-    env = ElevatorEnv(env_template.__dict__.copy() if hasattr(env_template, '__dict__') else {})
-    obs, _ = env.reset(options={"events": events_trimmed})
-    episode_reward = 0.0
-    done = False
-    num_elevators = getattr(env, 'num_elevators', 3)
     rng = np.random.RandomState(42)
-
-    while not done:
-        if hasattr(env, 'pending_calls') and env.pending_calls:
-            action = int(rng.randint(0, num_elevators))
-        else:
-            action = 0
-
-        obs, reward, done, _, _ = env.step(action)
-        episode_reward += reward
-
-    metrics = env.get_episode_metrics()
-    metrics["reward"] = episode_reward
-    return episode_reward, metrics
+    def _select(env):
+        if not env.pending_calls:
+            return 0
+        return int(rng.randint(0, env.num_elevators))
+    return _run_baseline_episode(env_cfg, events_trimmed, _select)
 
 
 def bootstrap_confidence_interval(data: np.ndarray, n_bootstrap: int = 2000, ci: float = 0.95):
@@ -111,7 +94,7 @@ def bootstrap_confidence_interval(data: np.ndarray, n_bootstrap: int = 2000, ci:
     return lo, hi
 
 
-def main():
+def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default=str(PROJ_ROOT / "checkpoints" / "best_model.pt"))
     parser.add_argument("--device", default="auto")
@@ -121,7 +104,10 @@ def main():
                         help="Skip baseline comparisons")
     parser.add_argument("--max-test", type=int, default=0,
                         help="Limit test files (0=all)")
-    args = parser.parse_args()
+    if args is None:
+        args = parser.parse_args()
+    elif isinstance(args, dict):
+        args = argparse.Namespace(**args)
 
     cfg = load_config()
     device = get_device(args.device)
@@ -182,17 +168,15 @@ def main():
 
             # Baselines (single deterministic run)
             if not args.no_baselines:
-                env_ccfg = dict(env_cfg)
-                env_ccfg = merge_reward_config(env_ccfg, cfg)
-                env_ccfg["num_elevators"] = env_cfg.get("num_elevators", 3)
+                baseline_cfg = merge_reward_config(dict(env_cfg), cfg)
 
-                nc_reward, nc_metrics = _baseline_nearest_car(env_template, events_trimmed)
+                nc_reward, nc_metrics = _baseline_nearest_car(baseline_cfg, events_trimmed)
                 scenario_rewards[label]["nearest_car"].append(nc_reward)
                 nc_metrics["file"] = file_id
                 nc_metrics["scenario"] = label
                 all_metrics[f"{label}_nearest_car"].append(nc_metrics)
 
-                rnd_reward, rnd_metrics = _baseline_random(env_template, events_trimmed)
+                rnd_reward, rnd_metrics = _baseline_random(baseline_cfg, events_trimmed)
                 scenario_rewards[label]["random"].append(rnd_reward)
                 rnd_metrics["file"] = file_id
                 rnd_metrics["scenario"] = label
@@ -208,7 +192,7 @@ def main():
     # Header
     if has_baselines:
         print(f"{'Scenario':<18} {'Files':>5} {'ModelR':>8} {'NC-R':>8} {'Rnd-R':>8} "
-              f"{'AvgWait':>8} {'p95Wait':>8} {'Long%':>7} {'Empty%':>7} {'OpEff%':>7}")
+              f"{'AvgWait':>8} {'p95Wait':>8} {'Long%':>7} {'Empty%':>7} {'OpEff%':>7} {'Qual':>6}")
     else:
         print(f"{'Scenario':<18} {'Files':>5} {'ModelR':>8} {'AvgWait':>8} "
               f"{'p50Wait':>8} {'p95Wait':>8} {'Long%':>7} {'Empty%':>7} {'OpEff%':>7}")
@@ -249,12 +233,15 @@ def main():
 
         name = SCENARIO_LABELS.get(label, f"Scenario{label}")
 
+        scheduling_quality = float(np.mean([m.get("scheduling_quality", 0) for m in mlist]))
+
         if has_baselines:
             nc_r = float(np.mean(scenario_rewards[label].get("nearest_car", [0])))
             rnd_r = float(np.mean(scenario_rewards[label].get("random", [0])))
+            sq = scheduling_quality
             print(f"{name:<18} {n_files:>5} {avg_reward:>8.2f} {nc_r:>8.2f} {rnd_r:>8.2f} "
                   f"{avg_wait:>8.2f} {p95_wait:>8.2f} {long_wait:>6.1f}% "
-                  f"{empty_rate:>6.1f}% {op_eff:>6.1f}%")
+                  f"{empty_rate:>6.1f}% {op_eff:>6.1f}% {sq:>6.3f}")
         else:
             print(f"{name:<18} {n_files:>5} {avg_reward:>8.2f} "
                   f"{avg_wait:>8.2f} {p50_wait:>8.2f} {p95_wait:>8.2f} "
@@ -266,6 +253,7 @@ def main():
             "long_wait_pct": long_wait, "empty_pct": empty_rate,
             "op_eff_pct": op_eff, "avg_reward": avg_reward,
             "reward_ci_lo": ci_lo, "reward_ci_hi": ci_hi,
+            "scheduling_quality": scheduling_quality,
         })
 
         # Print CI info
@@ -280,7 +268,8 @@ def main():
 
     print("-" * 90)
     print(f"{'OVERALL':<18} {len(test_idx):>5} {all_rewards.mean():>8.2f} "
-          f"{all_waits.mean():>8.2f} {'—':>8} {all_waits.std():>8.2f} "
+          f"{all_waits.mean():>8.2f} {np.percentile(all_waits, 50):>8.2f} "
+          f"{np.percentile(all_waits, 95):>8.2f} "
           f"{'—':>6} {'—':>6} {'—':>6}")
 
     # Save charts
@@ -297,7 +286,7 @@ def _plot_metrics(all_avgs: list[dict], has_baselines: bool = False):
     scenarios = [d["scenario"] for d in all_avgs]
     x = range(len(scenarios))
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     metrics = [
         ("avg_wait", "Avg Wait Time (s)", axes[0, 0]),
         ("p95_wait", "P95 Wait Time (s)", axes[0, 1]),
@@ -305,7 +294,13 @@ def _plot_metrics(all_avgs: list[dict], has_baselines: bool = False):
         ("empty_pct", "Empty Load Rate (%)", axes[1, 0]),
         ("op_eff_pct", "Operational Efficiency (%)", axes[1, 1]),
         ("avg_reward", "Avg Reward", axes[1, 2]),
+        ("scheduling_quality", "Scheduling Quality", axes[2, 0]),
     ]
+    # Hide unused subplots
+    for r in range(3):
+        for c in range(3):
+            if not any(a is axes[r, c] for _, _, a in metrics):
+                axes[r, c].set_visible(False)
 
     for key, ylabel, ax in metrics:
         vals = [d[key] for d in all_avgs]

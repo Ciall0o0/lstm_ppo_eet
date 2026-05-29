@@ -7,7 +7,7 @@ import logging
 from collections import deque
 
 from src.utils import load_config, PROJ_ROOT
-from src.plc.snap7_client import PLCClient, ElevatorPLCInterface
+from src.plc.snap7_client import PLCClient, ElevatorPLCInterface, DB_INPUT, DB_OUTPUT
 from src.inference import ElevatorScheduler
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,8 @@ class PLCInferenceBridge:
 
         plc_cfg = self.cfg.get("plc", {})
         self.poll_interval = plc_cfg.get("poll_interval_ms", 100) / 1000.0
-        self.db_number = plc_cfg.get("db_number", 1)
+        self.db_input = plc_cfg.get("db_input", DB_INPUT)
+        self.db_output = plc_cfg.get("db_output", DB_OUTPUT)
 
         ckpt = checkpoint_path or str(PROJ_ROOT / "checkpoints" / "best_model.pt")
         self.scheduler = ElevatorScheduler(checkpoint_path=ckpt, config_path=config_path)
@@ -47,7 +48,9 @@ class PLCInferenceBridge:
     def connect(self) -> bool:
         ok = self.client.connect()
         if ok:
-            self.interface = ElevatorPLCInterface(self.client, self.db_number)
+            self.interface = ElevatorPLCInterface(
+                self.client, self.db_input, self.db_output
+            )
             self.scheduler.reset()
             logger.info("Bridge connected to PLC")
         return ok
@@ -83,12 +86,15 @@ class PLCInferenceBridge:
             time.sleep(self.poll_interval)
 
     def _step(self):
-        """Single decision loop iteration."""
-        # Read all elevator states
+        """Single decision loop iteration — single PLC read for all data."""
+        # Single bulk read of all DB10 data (22 bytes)
+        data = self.interface.read_all_inputs()
+
+        # Parse all elevator states and floor calls from the same buffer
         elevators = []
         for el_id in range(ElevatorPLCInterface.NUM_ELEVATORS):
             try:
-                state = self.interface.read_elevator_state(el_id)
+                state = self.interface._parse_elevator_state(el_id, data)
                 elevators.append(state)
             except Exception:
                 elevators.append({
@@ -97,15 +103,11 @@ class PLCInferenceBridge:
                     "has_car_calls": False,
                 })
 
-        # Read floor calls
-        up_calls, down_calls = self.interface.read_floor_calls()
+        up_calls, down_calls = self.interface.parse_floor_calls(data)
 
-        # Check if any calls need assignment
-        any_calls = any(up_calls) or any(down_calls)
-        if not any_calls:
+        if not (any(up_calls) or any(down_calls)):
             return
 
-        # Build state dict and query scheduler
         state_dict = {
             "elevators": elevators,
             "floor_up_calls": up_calls,
@@ -119,36 +121,26 @@ class PLCInferenceBridge:
         self._stats["decisions"] += 1
         self._stats["last_decision_time"] = decision_time
 
-        # Determine which floor has an active call to assign (prioritize up calls)
-        call_floor = None
-        call_direction = 0
-        for f in range(10):
-            if up_calls[f]:
-                call_floor = f + 1
-                call_direction = 1
-                break
-            if down_calls[f]:
-                call_floor = f + 1
-                call_direction = -1
-                break
+        # Assign all active calls
+        for calls, direction in ((up_calls, 1), (down_calls, -1)):
+            for f in range(10):
+                if calls[f]:
+                    self.interface.write_call_indicator(f + 1, direction, True)
+                    self._decision_log.append({
+                        "timestamp": time.time(),
+                        "action": action,
+                        "floor": f + 1,
+                        "direction": direction,
+                        "decision_time_ms": decision_time,
+                    })
 
-        if call_floor is not None:
-            self.interface.write_call_assignment(action, call_floor, call_direction, True)
-
-            self._decision_log.append({
-                "timestamp": time.time(),
-                "action": action,
-                "floor": call_floor,
-                "direction": call_direction,
-                "decision_time_ms": decision_time,
-            })
-
-            if self._stats["decisions"] % 100 == 0:
-                logger.info(
-                    f"Decision #{self._stats['decisions']}: "
-                    f"elevator={action}, floor={call_floor}, dir={call_direction}, "
-                    f"latency={decision_time:.2f}ms"
-                )
+        if self._stats["decisions"] % 100 == 0:
+            n_calls = sum(up_calls) + sum(down_calls)
+            logger.info(
+                f"Decision #{self._stats['decisions']}: "
+                f"elevator={action}, calls={n_calls}, "
+                f"latency={decision_time:.2f}ms"
+            )
 
     def _reconnect(self) -> bool:
         for attempt in range(3):
@@ -156,7 +148,9 @@ class PLCInferenceBridge:
                 self.client.disconnect()
                 time.sleep(1.0)
                 if self.client.connect():
-                    self.interface = ElevatorPLCInterface(self.client, self.db_number)
+                    self.interface = ElevatorPLCInterface(
+                        self.client, self.db_input, self.db_output
+                    )
                     self.scheduler.reset()
                     return True
             except Exception:
@@ -178,6 +172,6 @@ if __name__ == "__main__":
 
     bridge = PLCInferenceBridge()
     print("Bridge initialized (no PLC connection in test mode)")
-    print(f"Config: poll_interval={bridge.poll_interval*1000:.0f}ms, db={bridge.db_number}")
+    print(f"Config: poll_interval={bridge.poll_interval*1000:.0f}ms, db_input={bridge.db_input}, db_output={bridge.db_output}")
     print(f"Scheduler model loaded: {bridge.scheduler.trainer.policy.training if hasattr(bridge.scheduler.trainer.policy, 'training') else False}")
     print("PLC Bridge module: OK")
