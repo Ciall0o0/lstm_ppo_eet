@@ -12,6 +12,8 @@ PROJ_ROOT = Path(__file__).resolve().parent.parent
 REWARD_KEYS = (
     "passenger_delivered", "wait_time_per_sec", "empty_distance_per_floor",
     "energy_per_start_stop", "idle_penalty_per_sec", "assignment_dist_per_floor",
+    "idle_center_bonus", "idle_spread_penalty",
+    "normalize", "clip_range",
 )
 
 
