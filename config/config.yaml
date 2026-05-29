@@ -28,8 +28,8 @@ model:
   critic_hidden: 128
   action_dim: 3
   activation: "relu"           # "relu", "gelu", or "silu"
-  actor_dropout: 0.05
-  critic_dropout: 0.05
+  actor_dropout: 0.0
+  critic_dropout: 0.0
   use_layer_norm: true
 
 ppo:
@@ -58,7 +58,7 @@ ppo:
 training:
   total_epochs: 200
   eval_every: 10
-  early_stop_patience: 15
+  early_stop_patience: 6
   save_dir: "checkpoints"
   num_envs: 32
   # LR warmup
@@ -72,7 +72,7 @@ reward:
   wait_time_per_sec: -0.01        # per-passenger per-second wait penalty
   empty_distance_per_floor: -0.05 # penalty for empty repositioning
   energy_per_start_stop: -0.02    # energy cost per start/stop
-  idle_penalty_per_sec: -0.01     # 2x stronger than original -0.005
+  idle_penalty_per_sec: -0.005    # original value
   idle_center_bonus: 0.0          # disabled — caused conflicting signals
   idle_spread_penalty: 0.0        # disabled — too aggressive for now
   assignment_dist_per_floor: -0.3 # penalty for assigning to distant elevator
