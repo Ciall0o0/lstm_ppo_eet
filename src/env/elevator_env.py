@@ -137,6 +137,18 @@ class Elevator:
         if self.state == "idle":
             self._select_next_target()
 
+    def reposition_to(self, target_floor: float):
+        """Reposition idle elevator to target floor. No passenger involved."""
+        if self.state != "idle":
+            return False
+        dist = abs(self.current_floor - target_floor)
+        if dist < 0.1:
+            return False  # already there
+        self.target_floor = target_floor
+        self.direction = 1 if target_floor > self.current_floor else -1
+        self.state = "moving"
+        return True
+
     def _select_next_target(self):
         if not self.car_calls:
             return
@@ -256,6 +268,7 @@ class ElevatorEnv(gym.Env):
         self.total_loaded_floors: float = 0.0
         self.start_stop_count: int = 0
         self.elevator_active_time: float = 0.0
+        self.reposition_count: int = 0
 
         # Reward config
         self.r_passenger = cfg.get("passenger_delivered", 2.0)
@@ -313,6 +326,7 @@ class ElevatorEnv(gym.Env):
         self.total_loaded_floors = 0.0
         self.start_stop_count = 0
         self.elevator_active_time = 0.0
+        self.reposition_count = 0
         self.idle_cluster_steps = 0
 
         # Normalize event times: shift to start at 0, scale to max 3600s
@@ -340,12 +354,13 @@ class ElevatorEnv(gym.Env):
     def step(self, action: int):
         """Process one scheduling decision.
 
-        action: elevator index (0..num_elevators-1) to assign to the oldest pending call.
-        If no pending calls, action is ignored and time advances to next event.
+        action: elevator index (0..num_elevators-1).
+        If pending calls: assign oldest call to that elevator.
+        If no pending calls: reposition that elevator to center floor.
         """
         reward = 0.0
 
-        # --- Assign pending call ---
+        # --- Assign pending call or reposition ---
         if self.pending_calls and 0 <= action < self.num_elevators:
             call = self.pending_calls.popleft()
             elevator = self.elevators[action]
@@ -359,6 +374,15 @@ class ElevatorEnv(gym.Env):
                 self.floors_up_calls.discard(call["floor"])
             else:
                 self.floors_down_calls.discard(call["floor"])
+        elif 0 <= action < self.num_elevators:
+            # No pending calls — reposition idle elevator to center floor
+            elevator = self.elevators[action]
+            center_floor = (MAX_FLOOR + 1) / 2.0  # 5.5 for 10-floor building
+            if elevator.reposition_to(center_floor):
+                dist = abs(elevator.current_floor - center_floor)
+                reward += self.r_start_stop  # energy cost for starting
+                reward += self.r_empty_floor * dist  # empty movement cost
+                self.reposition_count += 1
 
         # --- Determine time delta ---
         if self.pending_calls:
@@ -582,6 +606,7 @@ class ElevatorEnv(gym.Env):
             "total_loaded_floors": self.total_loaded_floors,
             "start_stop_count": self.start_stop_count,
             "elevator_active_time": self.elevator_active_time,
+            "reposition_count": self.reposition_count,
             "idle_cluster_steps": self.idle_cluster_steps,
         }
 
@@ -614,6 +639,7 @@ class ElevatorEnv(gym.Env):
             "elevator_uptime": self.elevator_active_time,
             "elevator_idle_time": max(0, self.elapsed * self.num_elevators - self.elevator_active_time),
             "num_elevators": self.num_elevators,
+            "reposition_count": self.reposition_count,
             "idle_cluster_steps": self.idle_cluster_steps,
         })
 
