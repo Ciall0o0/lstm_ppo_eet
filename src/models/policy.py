@@ -30,6 +30,9 @@ class LSTMActorCritic(nn.Module):
         actor_hidden: int = 64,
         critic_hidden: int = 64,
         activation: str = "relu",
+        actor_dropout: float = 0.0,
+        critic_dropout: float = 0.0,
+        use_layer_norm: bool = False,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -47,19 +50,23 @@ class LSTMActorCritic(nn.Module):
             batch_first=True,
         )
 
+        self.use_layer_norm = use_layer_norm
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(lstm_hidden)
+
         act_fn = _get_activation(activation)
 
-        self.actor = nn.Sequential(
-            nn.Linear(lstm_hidden, actor_hidden),
-            act_fn,
-            nn.Linear(actor_hidden, action_dim),
-        )
+        actor_layers = [nn.Linear(lstm_hidden, actor_hidden), act_fn]
+        if actor_dropout > 0:
+            actor_layers.append(nn.Dropout(p=actor_dropout))
+        actor_layers.append(nn.Linear(actor_hidden, action_dim))
+        self.actor = nn.Sequential(*actor_layers)
 
-        self.critic = nn.Sequential(
-            nn.Linear(lstm_hidden, critic_hidden),
-            act_fn,
-            nn.Linear(critic_hidden, 1),
-        )
+        critic_layers = [nn.Linear(lstm_hidden, critic_hidden), act_fn]
+        if critic_dropout > 0:
+            critic_layers.append(nn.Dropout(p=critic_dropout))
+        critic_layers.append(nn.Linear(critic_hidden, 1))
+        self.critic = nn.Sequential(*critic_layers)
 
         self._init_weights()
 
@@ -88,6 +95,8 @@ class LSTMActorCritic(nn.Module):
             hidden = self._init_hidden(batch_size, obs_seq.device)
 
         enc_out, hidden = self.encoder(obs_seq, hidden)
+        if self.use_layer_norm:
+            enc_out = self.layer_norm(enc_out)
         action_logits = self.actor(enc_out)
         values = self.critic(enc_out)
         return action_logits, values, hidden

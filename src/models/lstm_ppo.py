@@ -138,6 +138,9 @@ class PPOTrainer:
         kl_target: float = 0.01,
         kl_early_stop: bool = True,
         normalize_advantage: bool = True,
+        actor_dropout: float = 0.0,
+        critic_dropout: float = 0.0,
+        use_layer_norm: bool = False,
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -164,6 +167,8 @@ class PPOTrainer:
             lstm_dropout=lstm_dropout,
             actor_hidden=actor_hidden, critic_hidden=critic_hidden,
             activation=activation,
+            actor_dropout=actor_dropout, critic_dropout=critic_dropout,
+            use_layer_norm=use_layer_norm,
         ).to(self.device)
 
         if compile_policy and hasattr(torch, 'compile'):
@@ -173,12 +178,16 @@ class PPOTrainer:
                 pass
 
         use_fused = self.device.type == 'cuda'
-        # Separate LSTM and head params: weight decay on LSTM recurrent weights
-        # shrinks hidden state magnitude, hurting long-range dependencies
-        lstm_params = [p for n, p in self.policy.named_parameters() if "encoder" in n]
+        # Split LSTM weight decay: input weights benefit from regularization,
+        # recurrent weights (weight_hh) should not be decayed
+        lstm_ih = [p for n, p in self.policy.named_parameters() if "encoder" in n and "weight_ih" in n]
+        lstm_hh = [p for n, p in self.policy.named_parameters() if "encoder" in n and "weight_hh" in n]
+        lstm_bias = [p for n, p in self.policy.named_parameters() if "encoder" in n and "bias" in n]
         head_params = [p for n, p in self.policy.named_parameters() if "encoder" not in n]
         self.optimizer = optim.Adam([
-            {"params": lstm_params, "weight_decay": 0.0},
+            {"params": lstm_ih, "weight_decay": weight_decay * 0.5},
+            {"params": lstm_hh, "weight_decay": 0.0},
+            {"params": lstm_bias, "weight_decay": 0.0},
             {"params": head_params, "weight_decay": weight_decay},
         ], lr=lr, fused=use_fused)
 
@@ -228,6 +237,9 @@ class PPOTrainer:
             kl_target=ppo_cfg.get("kl_target", 0.01),
             kl_early_stop=ppo_cfg.get("kl_early_stop", True),
             normalize_advantage=ppo_cfg.get("normalize_advantage", True),
+            actor_dropout=model_cfg.get("actor_dropout", 0.0),
+            critic_dropout=model_cfg.get("critic_dropout", 0.0),
+            use_layer_norm=model_cfg.get("use_layer_norm", False),
         )
 
     @staticmethod
