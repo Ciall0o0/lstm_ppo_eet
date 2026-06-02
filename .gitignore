@@ -20,3 +20,6 @@ requirement
 *.log
 swanlog/
 fill_report.py
+报告.docx
+eet.zip
+monitor.py
