@@ -137,18 +137,6 @@ class Elevator:
         if self.state == "idle":
             self._select_next_target()
 
-    def reposition_to(self, target_floor: float):
-        """Reposition idle elevator to target floor. No passenger involved."""
-        if self.state != "idle":
-            return False
-        dist = abs(self.current_floor - target_floor)
-        if dist < 0.1:
-            return False  # already there
-        self.target_floor = target_floor
-        self.direction = 1 if target_floor > self.current_floor else -1
-        self.state = "moving"
-        return True
-
     def _select_next_target(self):
         if not self.car_calls:
             return
@@ -256,7 +244,6 @@ class ElevatorEnv(gym.Env):
         self.floors_up_calls: set[int] = set()
         self.floors_down_calls: set[int] = set()
         self.completed_passengers: list[dict] = []
-        self._any_elevators_active: bool = False
 
         # Sanity: computed state dim must match actual encoding size
         test_obs = self._get_obs()
@@ -268,7 +255,6 @@ class ElevatorEnv(gym.Env):
         self.total_loaded_floors: float = 0.0
         self.start_stop_count: int = 0
         self.elevator_active_time: float = 0.0
-        self.reposition_count: int = 0
 
         # Reward config
         self.r_passenger = cfg.get("passenger_delivered", 2.0)
@@ -276,9 +262,14 @@ class ElevatorEnv(gym.Env):
         self.r_empty_floor = cfg.get("empty_distance_per_floor", -0.1)
         self.r_start_stop = cfg.get("energy_per_start_stop", -0.05)
         self.r_idle_sec = cfg.get("idle_penalty_per_sec", 0.0)
-        self.r_assign_dist = cfg.get("assignment_dist_per_floor", -1.0)
-        self.r_idle_center = cfg.get("idle_center_bonus", 0.0)
-        self.r_idle_spread = cfg.get("idle_spread_penalty", 0.0)
+
+        # Assignment-level shaping: immediate reward at decision time
+        # These fire at dt=0 when the agent assigns a call to an elevator,
+        # giving the policy gradient a real signal about assignment quality.
+        self.r_proximity = cfg.get("assignment_proximity", -0.05)
+        self.r_dir_align = cfg.get("assignment_direction_align", 0.02)
+        self.r_load_balance = cfg.get("assignment_load_balance", -0.03)
+        self.r_estimated_wait = cfg.get("assignment_estimated_wait", -0.01)
 
         # Reward normalization (shared across episodes, passed from outside)
         normalize = cfg.get("normalize", False)
@@ -292,7 +283,7 @@ class ElevatorEnv(gym.Env):
         self._passenger_arrival_times: dict[int, float] = {}  # passenger_id → time entered pending_calls
 
         # Event-level features for observation (computed per injected event)
-        self._last_event_time: float = 0.0
+        self._last_event_time: float | None = None
 
     def _init_elevators(self):
         self.elevators = [
@@ -319,15 +310,12 @@ class ElevatorEnv(gym.Env):
         self.floors_down_calls.clear()
         self.completed_passengers.clear()
         self._event_wait_buffers.clear()
-        self._last_event_time = 0.0
-        self._any_elevators_active = False
+        self._last_event_time = None
 
         self.total_empty_floors = 0.0
         self.total_loaded_floors = 0.0
         self.start_stop_count = 0
         self.elevator_active_time = 0.0
-        self.reposition_count = 0
-        self.idle_cluster_steps = 0
 
         # Normalize event times: shift to start at 0, scale to max 3600s
         if self.events is not None and len(self.events) > 0:
@@ -354,19 +342,15 @@ class ElevatorEnv(gym.Env):
     def step(self, action: int):
         """Process one scheduling decision.
 
-        action: elevator index (0..num_elevators-1).
-        If pending calls: assign oldest call to that elevator.
-        If no pending calls: reposition that elevator to center floor.
+        action: elevator index (0..num_elevators-1) to assign to the oldest pending call.
+        If no pending calls, action is ignored and time advances to next event.
         """
         reward = 0.0
 
-        # --- Assign pending call or reposition ---
+        # --- Assign pending call ---
         if self.pending_calls and 0 <= action < self.num_elevators:
             call = self.pending_calls.popleft()
             elevator = self.elevators[action]
-            # Immediate assignment-quality reward: penalty for distance to pickup
-            dist = abs(elevator.current_floor - call["floor"])
-            reward += self.r_assign_dist * dist
             elevator.assign_call(call["floor"], call["dest"], call["passenger_id"])
             # Wait clock starts from passenger's true arrival, not assignment time
             self._event_wait_buffers[call["passenger_id"]] = call["arrival_time"]
@@ -374,15 +358,39 @@ class ElevatorEnv(gym.Env):
                 self.floors_up_calls.discard(call["floor"])
             else:
                 self.floors_down_calls.discard(call["floor"])
-        elif 0 <= action < self.num_elevators:
-            # No pending calls — reposition idle elevator to center floor
-            elevator = self.elevators[action]
-            center_floor = (MAX_FLOOR + 1) / 2.0  # 5.5 for 10-floor building
-            if elevator.reposition_to(center_floor):
-                dist = abs(elevator.current_floor - center_floor)
-                reward += self.r_start_stop  # energy cost for starting
-                reward += self.r_empty_floor * dist  # empty movement cost
-                self.reposition_count += 1
+
+            # --- Immediate assignment reward (dt=0 shaping) ---
+            # This is the ONLY reward signal at decision time. Without it,
+            # the policy gradient is pure noise because dt=0 produces zero reward
+            # for all standard components. The magnitudes are calibrated to be
+            # comparable to r_passenger (0.3) so the signal isn't drowned out.
+            pickup = call["floor"]
+
+            # 1. Proximity: penalize choosing a far-away elevator
+            #    Scale: 5 floors away → r_proximity * 5 = -0.25 (comparable to r_passenger=0.3)
+            dist_to_pickup = abs(elevator.current_floor - pickup)
+            reward += self.r_proximity * dist_to_pickup
+
+            # 2. Direction alignment: reward choosing an elevator already heading
+            #    toward the pickup floor (or idle). Penalize choosing one going away.
+            if elevator.direction == 0:
+                # Idle elevator: neutral, small bonus for being available
+                reward += self.r_dir_align * 0.5
+            elif elevator.direction == call["direction"]:
+                # Moving in the same direction as the call: good alignment
+                reward += self.r_dir_align * 1.0
+            else:
+                # Moving opposite direction: bad, must reverse
+                reward += self.r_dir_align * -1.0
+
+            # 3. Load balancing: penalize assigning to already-busy elevators
+            #    when others might be free
+            n_assigned = len(elevator.assigned_passengers)
+            reward += self.r_load_balance * n_assigned
+
+            # 4. Estimated wait: penalize assignments that will take long to serve
+            est_wait = self._estimate_pickup_time(call)
+            reward += self.r_estimated_wait * est_wait
 
         # --- Determine time delta ---
         if self.pending_calls:
@@ -410,14 +418,10 @@ class ElevatorEnv(gym.Env):
                         "wait_time": wait_time,
                         "ride_time": abs(p["dest"] - p["pickup"]) * self.floor_travel_time,
                     })
-                    # Time-decaying delivery reward: full reward for instant delivery,
-                    # linear decay to 0 at long_wait_threshold
-                    wait_ratio = min(wait_time / self.long_wait_threshold, 1.0)
-                    reward += self.r_passenger * (1.0 - wait_ratio)
+                    reward += self.r_passenger
 
             self.elapsed += dt
 
-            any_active = False
             for i in range(n_el):
                 el = elevators[i]
                 if el.is_moving:
@@ -434,40 +438,14 @@ class ElevatorEnv(gym.Env):
 
                 if el.state != "idle":
                     self.elevator_active_time += dt
-                    any_active = True
-                elif el.assigned_passengers:
-                    any_active = True
 
-            self._any_elevators_active = any_active
+            # Penalize waiting passengers (from true arrival time)
+            reward += self.r_wait_sec * dt * len(self._event_wait_buffers)
 
-            # Penalize waiting passengers (O(1) — no dict iteration)
-            n_waiting = len(self._event_wait_buffers)
-            if n_waiting:
-                reward += self.r_wait_sec * n_waiting * dt
-
-            # Penalize idle elevators + center proximity + spread
-            center_floor = (MAX_FLOOR + 1) / 2.0
-            idle_floor_counts: dict[int, int] = {}
-            for i in range(n_el):
-                if elevators[i].state == "idle":
+            # Penalize idle elevators
+            for el in self.elevators:
+                if el.state == "idle":
                     reward += self.r_idle_sec * dt
-                    # Center proximity bonus: linear decay from center
-                    dist_from_center = abs(elevators[i].current_floor - center_floor)
-                    center_factor = 1.0 - dist_from_center / (MAX_FLOOR / 2.0)
-                    reward += self.r_idle_center * max(0.0, center_factor) * dt
-                    # Track floor occupancy for spread penalty
-                    f = round(elevators[i].current_floor)
-                    idle_floor_counts[f] = idle_floor_counts.get(f, 0) + 1
-            # Idle spread penalty: discourage clustering on same floor
-            if self.r_idle_spread != 0.0:
-                for count in idle_floor_counts.values():
-                    if count > 1:
-                        reward += self.r_idle_spread * (count - 1) * dt
-            # Track clustering for metrics
-            if idle_floor_counts:
-                max_cluster = max(idle_floor_counts.values())
-                if max_cluster > 1:
-                    self.idle_cluster_steps += 1
 
         # --- Inject new events ---
         if self.events is not None:
@@ -517,7 +495,7 @@ class ElevatorEnv(gym.Env):
             dst = max(1, min(MAX_FLOOR, int(ev[1])))
 
             # Compute time_delta from consecutive normalized event times
-            if self._last_event_time > 0:
+            if self._last_event_time is not None:
                 time_delta = et - self._last_event_time
             else:
                 time_delta = 0.0
@@ -544,6 +522,30 @@ class ElevatorEnv(gym.Env):
                 else:
                     self.floors_down_calls.add(src)
             self.event_idx += 1
+
+    def _estimate_pickup_time(self, call: dict) -> float:
+        """Estimate seconds until an elevator reaches the pickup floor."""
+        pickup = call["floor"]
+        best_time = float("inf")
+        for el in self.elevators:
+            dist = abs(el.current_floor - pickup)
+            travel_time = dist * self.floor_travel_time
+            if el.state == "moving":
+                remaining = abs(el.target_floor - el.current_floor) * el.floor_travel_time
+                travel_time += remaining + self.door_open_time + self.door_close_time
+            elif el.state in ("doors_open", "doors_close"):
+                if dist < 0.1:
+                    # Already at pickup floor, just wait for current door op
+                    travel_time = el.door_timer
+                else:
+                    travel_time += el.door_timer + self.door_close_time
+            best_time = min(best_time, travel_time)
+        return best_time
+
+    @staticmethod
+    def _log_normalize(x: float, max_val: float) -> float:
+        """Signed log1p normalization, output in approximately [-1, 1]."""
+        return float(np.sign(x) * np.log1p(abs(x)) / np.log1p(max_val))
 
     def _get_obs(self) -> np.ndarray:
         oldest_floor = self.pending_calls[0]["floor"] if self.pending_calls else None
@@ -584,15 +586,54 @@ class ElevatorEnv(gym.Env):
         self._obs_buffer[offset] = min(self.elapsed / max_time, 1.0); offset += 1
         self._obs_buffer[offset] = min(len(self.pending_calls) / 30.0, 1.0); offset += 1
 
-        # Event-level features from oldest pending call
+        # Event-level features from oldest pending call (log-scale normalization)
         if self.pending_calls:
             oldest = self.pending_calls[0]
-            td = max(-60.0, min(300.0, oldest.get("time_delta", 0.0)))
-            self._obs_buffer[offset] = (td + 60.0) / 360.0; offset += 1
-            fd = max(-MAX_FLOOR, min(MAX_FLOOR, oldest.get("floor_delta", 0.0)))
-            self._obs_buffer[offset] = fd / MAX_FLOOR; offset += 1
+            td = oldest.get("time_delta", 0.0)
+            self._obs_buffer[offset] = self._log_normalize(td, 300.0); offset += 1
+            fd = oldest.get("floor_delta", 0.0)
+            self._obs_buffer[offset] = self._log_normalize(fd, MAX_FLOOR); offset += 1
         else:
             self._obs_buffer[offset] = 0.0; offset += 1
+            self._obs_buffer[offset] = 0.0; offset += 1
+
+        # --- New temporal/aggregate features ---
+
+        # Feature: event progress (how far through the event sequence)
+        if self.events is not None and len(self.events) > 0:
+            self._obs_buffer[offset] = self.event_idx / len(self.events)
+        else:
+            self._obs_buffer[offset] = 0.0
+        offset += 1
+
+        # Features: aggregate time_delta stats across ALL pending calls
+        if self.pending_calls:
+            all_td = [c.get("time_delta", 0.0) for c in self.pending_calls]
+            mean_td = float(np.mean(all_td))
+            max_td = float(np.max(all_td))
+            self._obs_buffer[offset] = self._log_normalize(mean_td, 300.0)
+            offset += 1
+            self._obs_buffer[offset] = self._log_normalize(max_td, 300.0)
+            offset += 1
+        else:
+            self._obs_buffer[offset] = 0.0; offset += 1
+            self._obs_buffer[offset] = 0.0; offset += 1
+
+        # Feature: aggregate floor_delta across all pending calls
+        if self.pending_calls:
+            all_fd = [c.get("floor_delta", 0.0) for c in self.pending_calls]
+            mean_fd = float(np.mean(all_fd))
+            self._obs_buffer[offset] = self._log_normalize(mean_fd, MAX_FLOOR)
+            offset += 1
+        else:
+            self._obs_buffer[offset] = 0.0; offset += 1
+
+        # Feature: estimated wait time for oldest pending call
+        if self.pending_calls:
+            est_wait = self._estimate_pickup_time(self.pending_calls[0])
+            self._obs_buffer[offset] = min(est_wait / 120.0, 1.0)
+            offset += 1
+        else:
             self._obs_buffer[offset] = 0.0; offset += 1
 
         return self._obs_buffer
@@ -606,24 +647,23 @@ class ElevatorEnv(gym.Env):
             "total_loaded_floors": self.total_loaded_floors,
             "start_stop_count": self.start_stop_count,
             "elevator_active_time": self.elevator_active_time,
-            "reposition_count": self.reposition_count,
-            "idle_cluster_steps": self.idle_cluster_steps,
         }
 
     def _is_done(self) -> bool:
         if self.elapsed >= self.max_total_time:
             return True
-        if self.events is None or self.event_idx < len(self.events):
+        if self.events is not None and self.event_idx < len(self.events):
             return False
         if self.pending_calls:
             return False
-        if self._any_elevators_active:
-            return False
-        return bool(self.completed_passengers)
+        for el in self.elevators:
+            if el.is_moving or el.assigned_passengers:
+                return False
+        return True
 
     @staticmethod
     def _compute_state_dim(num_elevators: int) -> int:
-        return (MAX_FLOOR + 3 + 7) * num_elevators + MAX_FLOOR * 4 + 2 + 2
+        return (MAX_FLOOR + 3 + 7) * num_elevators + MAX_FLOOR * 4 + 2 + 2 + 5
 
     @property
     def STATE_DIM(self) -> int:
@@ -639,8 +679,6 @@ class ElevatorEnv(gym.Env):
             "elevator_uptime": self.elevator_active_time,
             "elevator_idle_time": max(0, self.elapsed * self.num_elevators - self.elevator_active_time),
             "num_elevators": self.num_elevators,
-            "reposition_count": self.reposition_count,
-            "idle_cluster_steps": self.idle_cluster_steps,
         })
 
 

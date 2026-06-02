@@ -15,8 +15,9 @@ PROJ_ROOT = Path(__file__).resolve().parent.parent
 
 REWARD_KEYS = (
     "passenger_delivered", "wait_time_per_sec", "empty_distance_per_floor",
-    "energy_per_start_stop", "idle_penalty_per_sec", "assignment_dist_per_floor",
-    "idle_center_bonus", "idle_spread_penalty",
+    "energy_per_start_stop", "idle_penalty_per_sec",
+    "assignment_proximity", "assignment_direction_align", "assignment_load_balance",
+    "assignment_estimated_wait",
     "normalize", "clip_range",
 )
 
@@ -45,13 +46,18 @@ def set_seed(seed: int):
 
 
 PPO_OPTUNA_KEYS = {
-    "learning_rate", "entropy_coef_start", "entropy_coef_end",
+    "learning_rate", "entropy_coef_start", "entropy_coef_end", "entropy_floor",
     "max_grad_norm", "clip_epsilon", "value_loss_coef",
     "batch_size", "ppo_epochs", "weight_decay", "seq_len",
+    "burn_in_steps", "kl_target",
 }
 MODEL_OPTUNA_KEYS = {
     "lstm_hidden", "lstm_layers", "lstm_dropout",
     "actor_hidden", "critic_hidden", "activation",
+}
+REWARD_OPTUNA_KEYS = {
+    "assignment_proximity", "assignment_direction_align",
+    "assignment_load_balance", "assignment_estimated_wait",
 }
 
 
@@ -96,7 +102,8 @@ def load_optuna_params(cfg: dict, path: str | None = None) -> dict:
 
 
 def merge_reward_config(env_cfg: dict, cfg: dict) -> dict:
-    """Copy reward keys from cfg['reward'] into env_cfg (mutates env_cfg)."""
+    """Merge reward keys from cfg['reward'] into a copy of env_cfg."""
+    env_cfg = dict(env_cfg)
     reward_cfg = cfg.get("reward", {})
     for k in REWARD_KEYS:
         if k in reward_cfg:

@@ -16,67 +16,67 @@ env:
   dwell_time: 3.0
   idle_timeout: 60.0
   long_wait_threshold: 60.0
-  max_total_time: 5400.0
+  max_total_time: 3600.0
 
 model:
   # state_dim and action_dim are derived from ElevatorEnv at runtime; these are informational only
-  state_dim: 104
-  lstm_hidden: 128
-  lstm_layers: 1
-  lstm_dropout: 0.0               # dead code when lstm_layers=1, set to 0 for clarity
-  actor_hidden: 128
-  critic_hidden: 128
+  state_dim: 109
+  lstm_hidden: 256
+  lstm_layers: 2
+  lstm_dropout: 0.1
+  actor_hidden: 64
+  critic_hidden: 64
   action_dim: 3
-  activation: "relu"           # "relu", "gelu", or "silu"
+  activation: "relu"
   actor_dropout: 0.0
   critic_dropout: 0.0
   use_layer_norm: true
 
 ppo:
-  learning_rate: 3.0e-04          # higher LR for faster policy learning
+  learning_rate: 3.0e-04
   gamma: 0.99
   gae_lambda: 0.95
-  clip_epsilon: 0.18133817135484062
-  value_loss_coef: 0.6999622009212532
-  entropy_coef_start: 0.01        # low for 3-action space (log(3)≈1.1)
-  entropy_coef_end: 0.001         # minimal late-training pressure
-  max_grad_norm: 2.400298736924491
-  ppo_epochs: 10                  # more gradient steps per collection
+  clip_epsilon: 0.20
+  value_loss_coef: 0.70
+  entropy_coef_start: 0.01
+  entropy_coef_end: 0.001
+  entropy_floor: 0.0
+  max_grad_norm: 1.0
+  ppo_epochs: 10
   batch_size: 8192
   rollout_steps: 32768
   seq_len: 32
-  weight_decay: 6.69907663855107e-04
-  compile_policy: true
-  # AMP mixed precision (GPU only)
+  burn_in_steps: 8
+  weight_decay: 0.0001
+  compile_policy: false
   use_amp: true
-  # KL early stopping (stops PPO epochs early if KL exceeds target)
   kl_early_stop: true
   kl_target: 0.01
-  # Advantage normalization (disabled to preserve raw advantage signal)
   normalize_advantage: false
+  normalize_rewards: false
 
 training:
   total_epochs: 200
-  eval_every: 10
-  early_stop_patience: 6
+  eval_every: 5
+  early_stop_patience: 20
   save_dir: "checkpoints"
-  num_envs: 32
-  # LR warmup
-  warmup_epochs: 5             # linear warmup epochs (0 to disable)
-  warmup_ratio: 0.1            # initial LR = lr * warmup_ratio
-  # Resume from checkpoint (set to path or leave empty)
+  num_envs: 16
+  warmup_epochs: 0
+  warmup_ratio: 0.1
   resume_checkpoint: ""
 
 reward:
-  passenger_delivered: 1.0        # time-decayed: full reward for instant delivery, 0 at long_wait_threshold
-  wait_time_per_sec: -0.01        # per-passenger per-second wait penalty
-  empty_distance_per_floor: -0.05 # penalty for empty repositioning
-  energy_per_start_stop: -0.02    # energy cost per start/stop
-  idle_penalty_per_sec: -0.005    # original value
-  idle_center_bonus: 0.0          # disabled — caused conflicting signals
-  idle_spread_penalty: 0.0        # disabled — too aggressive for now
-  assignment_dist_per_floor: -0.3 # penalty for assigning to distant elevator
-  # Reward normalization: batch-level in PPOTrainer (not per-env)
+  passenger_delivered: 3.0             # 10x increase — delivery must dominate shaping
+  wait_time_per_sec: -0.001
+  empty_distance_per_floor: -0.005
+  energy_per_start_stop: -0.002
+  idle_penalty_per_sec: -0.005
+  # Assignment-level shaping: immediate reward at decision time (dt=0).
+  # Keep small relative to r_passenger so delivery stays the primary signal.
+  assignment_proximity: -2.0           # per floor distance (5 floors → -10)
+  assignment_direction_align: 1.5      # reward for aligned direction
+  assignment_load_balance: -1.5        # per already-assigned passenger
+  assignment_estimated_wait: -0.03     # per second of estimated pickup time
   normalize: false
   clip_range: 5.0
 

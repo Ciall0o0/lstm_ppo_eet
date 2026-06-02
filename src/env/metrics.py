@@ -102,11 +102,9 @@ def compute_episode_metrics(episode_stats: dict) -> dict:
         "energy_kinetic_wh": energy["kinetic_wh"],
         "total_movement_floors": total_movement,
         "start_stop_count": episode_stats.get("start_stop_count", 0),
-        "reposition_count": episode_stats.get("reposition_count", 0),
         "scheduling_quality": scheduling_quality(
             avg_wait_time(wait_times), long_wait_rate(wait_times), op_eff
         ),
-        "idle_cluster_rate": episode_stats.get("idle_cluster_steps", 0) / max(1, int(total_time)),
     }
 
 

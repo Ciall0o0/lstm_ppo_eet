@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import Categorical
 import numpy as np
 
 from .policy import LSTMActorCritic
@@ -23,16 +24,14 @@ class RunningRewardNormalizer:
         self.count = 1e-8
         self.clip_range = clip_range
 
-    def normalize(self, rewards: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    def normalize(self, rewards: torch.Tensor) -> torch.Tensor:
         """Normalize rewards using running statistics, update stats from this batch."""
-        valid = masks.bool()
-        if valid.sum() < 2:
+        if rewards.numel() < 2:
             return rewards
 
-        batch_rewards = rewards[valid]
-        batch_mean = batch_rewards.mean()
-        batch_var = batch_rewards.var(correction=1)
-        batch_count = float(batch_rewards.numel())
+        batch_mean = rewards.mean()
+        batch_var = rewards.var(correction=1)
+        batch_count = float(rewards.numel())
 
         # Welford's online merge
         delta = batch_mean - self.mean
@@ -66,7 +65,6 @@ class RolloutBuffer:
         self.values = torch.zeros(max_steps, device=device)
         self.log_probs = torch.zeros(max_steps, device=device)
         self.dones = torch.zeros(max_steps, device=device)
-        self.masks = torch.ones(max_steps, device=device)
         self.head = [i * self.per_env for i in range(num_envs)]
         self._size = 0
 
@@ -83,7 +81,6 @@ class RolloutBuffer:
         self.values[ptr] = value
         self.log_probs[ptr] = log_prob
         self.dones[ptr] = float(done)
-        self.masks[ptr] = 1.0
         self.head[env_id] = ptr + 1
         self._size += 1
 
@@ -102,7 +99,8 @@ class RolloutBuffer:
         return self._size >= min_total
 
     def clear(self):
-        self.head = [i * self.per_env for i in range(self.num_envs)]
+        for i in range(self.num_envs):
+            self.head[i] = i * self.per_env
         self._size = 0
 
 
@@ -124,6 +122,7 @@ class PPOTrainer:
         batch_size: int = 64,
         rollout_steps: int = 2048,
         seq_len: int = 32,
+        burn_in_steps: int = 0,
         lstm_hidden: int = 128,
         lstm_layers: int = 2,
         actor_hidden: int = 64,
@@ -138,6 +137,7 @@ class PPOTrainer:
         kl_target: float = 0.01,
         kl_early_stop: bool = True,
         normalize_advantage: bool = True,
+        normalize_rewards: bool = False,
         actor_dropout: float = 0.0,
         critic_dropout: float = 0.0,
         use_layer_norm: bool = False,
@@ -154,10 +154,12 @@ class PPOTrainer:
         self.batch_size = batch_size
         self.rollout_steps = rollout_steps
         self.seq_len = seq_len
+        self.burn_in_steps = burn_in_steps
         self.num_envs = num_envs
         self.kl_target = kl_target
         self.kl_early_stop = kl_early_stop
         self.normalize_advantage = normalize_advantage
+        self.normalize_rewards = normalize_rewards
         self.use_amp = use_amp
         self.device = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -178,18 +180,22 @@ class PPOTrainer:
                 pass
 
         use_fused = self.device.type == 'cuda'
-        # Split LSTM weight decay: input weights benefit from regularization,
-        # recurrent weights (weight_hh) should not be decayed
-        lstm_ih = [p for n, p in self.policy.named_parameters() if "encoder" in n and "weight_ih" in n]
-        lstm_hh = [p for n, p in self.policy.named_parameters() if "encoder" in n and "weight_hh" in n]
-        lstm_bias = [p for n, p in self.policy.named_parameters() if "encoder" in n and "bias" in n]
-        head_params = [p for n, p in self.policy.named_parameters() if "encoder" not in n]
-        self.optimizer = optim.Adam([
-            {"params": lstm_ih, "weight_decay": weight_decay * 0.5},
-            {"params": lstm_hh, "weight_decay": 0.0},
-            {"params": lstm_bias, "weight_decay": 0.0},
-            {"params": head_params, "weight_decay": weight_decay},
-        ], lr=lr, fused=use_fused)
+        # Separate actor and critic parameter groups for independent gradient clipping
+        actor_params = []
+        critic_params = []
+        for n, p in self.policy.named_parameters():
+            if "actor" in n:
+                actor_params.append(p)
+            elif "critic" in n:
+                critic_params.append(p)
+            else:
+                # Shared encoder params (shouldn't exist with separate encoders, but safety)
+                actor_params.append(p)
+                critic_params.append(p)
+        self.actor_optimizer = optim.Adam(actor_params, lr=lr, weight_decay=weight_decay, fused=use_fused)
+        self.critic_optimizer = optim.Adam(critic_params, lr=lr, weight_decay=weight_decay, fused=use_fused)
+        # Alias for save/load compatibility
+        self.optimizer = self.actor_optimizer
 
         self.scaler = torch.amp.GradScaler('cuda') if (use_amp and self.device.type == 'cuda') else None
 
@@ -217,12 +223,13 @@ class PPOTrainer:
             gae_lambda=ppo_cfg.get("gae_lambda", 0.95),
             clip_epsilon=ppo_cfg.get("clip_epsilon", 0.2),
             value_loss_coef=ppo_cfg.get("value_loss_coef", 0.5),
-            entropy_coef=ppo_cfg.get("entropy_coef", 0.01),
+            entropy_coef=ppo_cfg.get("entropy_coef_start", 0.05),
             max_grad_norm=ppo_cfg.get("max_grad_norm", 0.5),
             ppo_epochs=ppo_cfg.get("ppo_epochs", 10),
             batch_size=ppo_cfg.get("batch_size", 64),
             rollout_steps=rollout_steps,
             seq_len=ppo_cfg.get("seq_len", 32),
+            burn_in_steps=ppo_cfg.get("burn_in_steps", 0),
             lstm_hidden=model_cfg.get("lstm_hidden", 128),
             lstm_layers=model_cfg.get("lstm_layers", 2),
             lstm_dropout=model_cfg.get("lstm_dropout", 0.0),
@@ -237,6 +244,7 @@ class PPOTrainer:
             kl_target=ppo_cfg.get("kl_target", 0.01),
             kl_early_stop=ppo_cfg.get("kl_early_stop", True),
             normalize_advantage=ppo_cfg.get("normalize_advantage", True),
+            normalize_rewards=ppo_cfg.get("normalize_rewards", False),
             actor_dropout=model_cfg.get("actor_dropout", 0.0),
             critic_dropout=model_cfg.get("critic_dropout", 0.0),
             use_layer_norm=model_cfg.get("use_layer_norm", False),
@@ -245,7 +253,7 @@ class PPOTrainer:
     @staticmethod
     @torch.jit.script
     def _compute_gae_jit(rewards: torch.Tensor, values: torch.Tensor,
-                         dones: torch.Tensor, masks: torch.Tensor,
+                         dones: torch.Tensor,
                          gamma: float, gae_lambda: float,
                          last_value: float) -> tuple[torch.Tensor, torch.Tensor]:
         T = rewards.size(0)
@@ -263,15 +271,14 @@ class PPOTrainer:
             gae = deltas[t] + discount * (1.0 - dones[t]) * gae
             advantages[t] = gae
 
-        advantages = advantages * masks
         returns = advantages + values
         return advantages, returns
 
     def compute_gae(self, rewards: torch.Tensor, values: torch.Tensor,
-                    dones: torch.Tensor, masks: torch.Tensor,
+                    dones: torch.Tensor,
                     last_value: torch.Tensor | float = 0.0) -> tuple[torch.Tensor, torch.Tensor]:
         lv = float(last_value) if not isinstance(last_value, float) else last_value
-        return self._compute_gae_jit(rewards, values, dones, masks,
+        return self._compute_gae_jit(rewards, values, dones,
                                      self.gamma, self.gae_lambda, lv)
 
     def update(self, last_obs_per_env: list | None = None):
@@ -285,7 +292,6 @@ class PPOTrainer:
         all_act_segs = []
         all_old_lp_segs = []
         all_old_v_segs = []
-        all_mask_segs = []
 
         last_obs_indices = []
         last_obs_list = []
@@ -294,7 +300,7 @@ class PPOTrainer:
                 last_obs_indices.append(i)
                 last_obs_list.append(last_obs_per_env[i])
 
-        last_values = [torch.tensor(0.0, device=self.device)] * self.num_envs
+        last_values = [torch.tensor(0.0, device=self.device) for _ in range(self.num_envs)]
         if last_obs_list:
             with torch.no_grad():
                 obs_stack = np.stack(last_obs_list)
@@ -304,33 +310,54 @@ class PPOTrainer:
                 for j, i in enumerate(last_obs_indices):
                     last_values[i] = v_batch[j].squeeze()
 
+        burn_in = self.burn_in_steps
+        total_window = burn_in + self.seq_len
+
         for i in range(self.num_envs):
             start, end = self.buffer.get_env_slice(i)
             n = end - start
-            if n < self.seq_len:
+            if n < total_window:
                 continue
 
-            # Batch-level reward normalization (replaces per-env normalization)
-            rewards = self.reward_normalizer.normalize(
-                self.buffer.rewards[start:end], self.buffer.masks[start:end])
+            # Batch-level reward normalization (disabled by default — raw
+            # rewards keep the signal intact for this reward structure)
+            raw_rewards = self.buffer.rewards[start:end]
+            rewards = self.reward_normalizer.normalize(raw_rewards) if self.normalize_rewards else raw_rewards
             values = self.buffer.values[start:end]
             dones = self.buffer.dones[start:end]
-            masks = self.buffer.masks[start:end]
 
-            adv, ret = self.compute_gae(rewards, values, dones, masks, last_values[i])
+            adv, ret = self.compute_gae(rewards, values, dones,
+                                        last_values[i])
 
-            usable = (n // self.seq_len) * self.seq_len
+            # Segments overlap: stride = seq_len, each window = burn_in + seq_len
+            usable = ((n - burn_in) // self.seq_len) * self.seq_len
             n_seg = usable // self.seq_len
 
-            all_obs_segs.append(self.buffer.obs[start:start + usable].view(n_seg, self.seq_len, -1))
-            all_act_segs.append(self.buffer.actions[start:start + usable].view(n_seg, self.seq_len))
-            all_old_lp_segs.append(self.buffer.log_probs[start:start + usable].view(n_seg, self.seq_len))
-            all_old_v_segs.append(values[:usable].view(n_seg, self.seq_len))
-            all_adv_segs = adv[:usable].view(n_seg, self.seq_len)
-            all_ret_segs = ret[:usable].view(n_seg, self.seq_len)
-            all_mask_segs.append(masks[:usable].view(n_seg, self.seq_len))
-            all_advantages.append(all_adv_segs)
-            all_returns.append(all_ret_segs)
+            obs_windows = []
+            act_windows = []
+            old_lp_windows = []
+            old_v_windows = []
+            adv_windows = []
+            ret_windows = []
+            for s in range(n_seg):
+                seg_start = start + s * self.seq_len
+                obs_windows.append(self.buffer.obs[seg_start:seg_start + total_window])
+                # Training portion starts at seg_start + burn_in
+                act_start = seg_start + burn_in
+                act_windows.append(self.buffer.actions[act_start:act_start + self.seq_len])
+                old_lp_windows.append(self.buffer.log_probs[act_start:act_start + self.seq_len])
+                # values/adv/ret are local to this env slice, so offset from local start
+                local_start = seg_start - start + burn_in
+                old_v_windows.append(values[local_start:local_start + self.seq_len])
+                adv_windows.append(adv[local_start:local_start + self.seq_len])
+                ret_windows.append(ret[local_start:local_start + self.seq_len])
+
+            all_obs_segs.append(torch.stack(obs_windows))
+            all_act_segs.append(torch.stack(act_windows))
+            all_old_lp_segs.append(torch.stack(old_lp_windows))
+            all_old_v_segs.append(torch.stack(old_v_windows))
+            all_advantages.append(torch.stack(adv_windows))
+            all_returns.append(torch.stack(ret_windows))
 
         if not all_obs_segs:
             self.buffer.clear()
@@ -342,7 +369,12 @@ class PPOTrainer:
         old_v_segs = torch.cat(all_old_v_segs)
         adv_segs = torch.cat(all_advantages)
         ret_segs = torch.cat(all_returns)
-        mask_segs = torch.cat(all_mask_segs)
+
+        # Log raw advantage stats BEFORE normalization (post-normalization stats are always ~0,~1)
+        with torch.no_grad():
+            raw_adv_mean = adv_segs.mean().item()
+            raw_adv_std = adv_segs.std().item()
+            raw_adv_frac_pos = (adv_segs > 0).float().mean().item()
 
         if self.normalize_advantage:
             adv_std, adv_mean = torch.std_mean(adv_segs, correction=1)
@@ -357,7 +389,8 @@ class PPOTrainer:
         total_value_loss = torch.tensor(0.0, device=self.device)
         total_entropy = torch.tensor(0.0, device=self.device)
         total_clip_frac = torch.tensor(0.0, device=self.device)
-        grad_norm = torch.tensor(0.0, device=self.device)
+        total_actor_grad_norm = torch.tensor(0.0, device=self.device)
+        total_critic_grad_norm = torch.tensor(0.0, device=self.device)
         n_updates = 0
 
         n_segments = obs_segs.size(0)
@@ -377,38 +410,73 @@ class PPOTrainer:
                 old_v_b = old_v_segs[batch_idx]
                 adv_b = adv_segs[batch_idx]
                 ret_b = ret_segs[batch_idx]
-                mask_b = mask_segs[batch_idx]
 
                 use_amp_step = self.scaler is not None
                 with torch.amp.autocast('cuda', enabled=use_amp_step):
-                    _, new_lp, new_v, ent, _ = self.policy.evaluate_actions(obs_b, act_b)
+                    # Forward full sequence (burn-in + training) through LSTM
+                    # then slice to training portion for loss computation
+                    full_logits, full_values, _ = self.policy.forward(obs_b)
+                    if burn_in > 0:
+                        action_logits = full_logits[:, burn_in:]
+                        new_v = full_values[:, burn_in:].squeeze(-1)
+                    else:
+                        action_logits = full_logits
+                        new_v = full_values.squeeze(-1)
+                    dist = Categorical(logits=action_logits)
+                    new_lp = dist.log_prob(act_b)
+                    ent = dist.entropy()
 
                     ratio = torch.exp(new_lp - old_lp_b)
                     surr1 = ratio * adv_b
                     surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * adv_b
-                    policy_loss = -(torch.min(surr1, surr2) * mask_b).sum() / mask_b.sum()
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-                    v_clipped = old_v_b + torch.clamp(new_v - old_v_b, -self.clip_epsilon, self.clip_epsilon)
-                    v_loss_unclipped = (new_v - ret_b) ** 2
-                    v_loss_clipped = (v_clipped - ret_b) ** 2
-                    value_loss = (torch.max(v_loss_unclipped, v_loss_clipped) * mask_b).sum() / mask_b.sum()
+                    v_clipped = old_v_b + torch.clamp(
+                        new_v - old_v_b, -self.clip_epsilon, self.clip_epsilon)
+                    vl_unclipped = nn.functional.huber_loss(new_v, ret_b, delta=10.0)
+                    vl_clipped = nn.functional.huber_loss(v_clipped, ret_b, delta=10.0)
+                    value_loss = torch.max(vl_unclipped, vl_clipped)
 
-                    ent_loss = (ent * mask_b).sum() / mask_b.sum()
+                    ent_loss = ent.mean()
 
-                    loss = (policy_loss + self.value_loss_coef * value_loss
-                            - self.entropy_coef * ent_loss)
+                    actor_loss = policy_loss - self.entropy_coef * ent_loss
+                    critic_loss = self.value_loss_coef * value_loss
 
-                self.optimizer.zero_grad()
+                # Separate backward + gradient clipping for actor and critic
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
                 if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    self.scaler.step(self.optimizer)
+                    self.scaler.scale(actor_loss).backward(retain_graph=True)
+                    self.scaler.unscale_(self.actor_optimizer)
+                    actor_grad_norm = nn.utils.clip_grad_norm_(
+                        [p for n, p in self.policy.named_parameters() if "actor" in n],
+                        self.max_grad_norm)
+                    self.scaler.step(self.actor_optimizer)
+
+                    self.scaler.scale(critic_loss).backward()
+                    self.scaler.unscale_(self.critic_optimizer)
+                    critic_grad_norm = nn.utils.clip_grad_norm_(
+                        [p for n, p in self.policy.named_parameters() if "critic" in n],
+                        self.max_grad_norm)
+                    self.scaler.step(self.critic_optimizer)
                     self.scaler.update()
+                    total_actor_grad_norm += actor_grad_norm
+                    total_critic_grad_norm += critic_grad_norm
                 else:
-                    loss.backward()
-                    grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
+                    actor_loss.backward(retain_graph=True)
+                    actor_grad_norm = nn.utils.clip_grad_norm_(
+                        [p for n, p in self.policy.named_parameters() if "actor" in n],
+                        self.max_grad_norm)
+                    self.actor_optimizer.step()
+
+                    self.critic_optimizer.zero_grad()
+                    critic_loss.backward()
+                    critic_grad_norm = nn.utils.clip_grad_norm_(
+                        [p for n, p in self.policy.named_parameters() if "critic" in n],
+                        self.max_grad_norm)
+                    self.critic_optimizer.step()
+                    total_actor_grad_norm += actor_grad_norm
+                    total_critic_grad_norm += critic_grad_norm
 
                 total_policy_loss += policy_loss.detach()
                 total_value_loss += value_loss.detach()
@@ -418,12 +486,12 @@ class PPOTrainer:
                 # Clip fraction: how often ratio exceeds clip bounds
                 with torch.no_grad():
                     clip_frac_val = ((ratio.detach() - 1.0).abs() > self.clip_epsilon).float()
-                    total_clip_frac += (clip_frac_val * mask_b).sum() / mask_b.sum()
+                    total_clip_frac += clip_frac_val.mean()
 
                 # Accumulate KL for early stopping
                 if self.kl_early_stop:
-                    epoch_kl_sum += ((old_lp_b - new_lp.detach()) * mask_b).sum()
-                    epoch_kl_count += mask_b.sum()
+                    epoch_kl_sum += (old_lp_b - new_lp.detach()).sum()
+                    epoch_kl_count += old_lp_b.numel()
 
             # KL early stopping: stop only when policy diverges (positive KL),
             # not when it improves (negative KL means new_lp > old_lp)
@@ -443,11 +511,15 @@ class PPOTrainer:
             "value_loss": (total_value_loss / max(n_updates, 1)).item(),
             "entropy": (total_entropy / max(n_updates, 1)).item(),
             "n_updates": n_updates,
-            "grad_norm": grad_norm.item(),
+            "actor_grad_norm": (total_actor_grad_norm / max(n_updates, 1)).item(),
+            "critic_grad_norm": (total_critic_grad_norm / max(n_updates, 1)).item(),
             "approx_kl": last_approx_kl,
             "clip_frac": (total_clip_frac / max(n_updates, 1)).item(),
             "explained_var": explained_var.item(),
             "value_pred_error": value_pred_error.item(),
+            "adv_mean": raw_adv_mean,
+            "adv_std": raw_adv_std,
+            "adv_frac_pos": raw_adv_frac_pos,
         }
         return self.stats
 
@@ -455,7 +527,8 @@ class PPOTrainer:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         data = {
             "policy_state": self.policy.state_dict(),
-            "optimizer_state": self.optimizer.state_dict(),
+            "actor_optimizer_state": self.actor_optimizer.state_dict(),
+            "critic_optimizer_state": self.critic_optimizer.state_dict(),
             "stats": self.stats,
             "reward_normalizer": {
                 "mean": self.reward_normalizer.mean.item(),
@@ -470,10 +543,27 @@ class PPOTrainer:
             data["scheduler_state"] = scheduler.state_dict()
         torch.save(data, path)
 
-    def load(self, path: str):
+    def load(self, path: str, load_optimizer: bool = True):
         ckpt = torch.load(path, map_location=self.device)
-        self.policy.load_state_dict(ckpt["policy_state"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        missing, unexpected = self.policy.load_state_dict(ckpt["policy_state"], strict=False)
+        if missing or unexpected:
+            print(f"[load] missing={missing}, unexpected={unexpected}")
+        if load_optimizer:
+            # Support both old single-optimizer and new dual-optimizer checkpoints
+            if "actor_optimizer_state" in ckpt:
+                try:
+                    self.actor_optimizer.load_state_dict(ckpt["actor_optimizer_state"])
+                except (ValueError, RuntimeError):
+                    pass
+                try:
+                    self.critic_optimizer.load_state_dict(ckpt["critic_optimizer_state"])
+                except (ValueError, RuntimeError):
+                    pass
+            elif "optimizer_state" in ckpt:
+                try:
+                    self.actor_optimizer.load_state_dict(ckpt["optimizer_state"])
+                except (ValueError, RuntimeError):
+                    pass
         self.stats = ckpt.get("stats", {})
         if "reward_normalizer" in ckpt:
             rn = ckpt["reward_normalizer"]
@@ -508,7 +598,6 @@ if __name__ == "__main__":
         trainer.buffer.values[start:end] = torch.randn(n, device=trainer.device)
         trainer.buffer.log_probs[start:end] = torch.randn(n, device=trainer.device)
         trainer.buffer.dones[start:end] = torch.zeros(n, device=trainer.device)
-        trainer.buffer.masks[start:end] = torch.ones(n, device=trainer.device)
         trainer.buffer.head[env_id] = end
         trainer.buffer._size += n
 

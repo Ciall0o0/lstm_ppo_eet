@@ -14,10 +14,11 @@ def _get_activation(name: str) -> nn.Module:
 
 
 class LSTMActorCritic(nn.Module):
-    """Shared LSTM encoder with independent Actor and Critic heads.
+    """Separate LSTM encoders for Actor and Critic to prevent gradient interference.
 
-    Standard LSTM+PPO architecture: LSTM encoder produces a hidden state,
-    which feeds into separate actor (action logits) and critic (value) MLPs.
+    Each branch has its own LSTM encoder, LayerNorm, and MLP head.
+    This eliminates the problem where value gradients dominate the shared encoder
+    and prevent the policy from learning.
     """
 
     def __init__(
@@ -42,7 +43,15 @@ class LSTMActorCritic(nn.Module):
 
         dropout = lstm_dropout if lstm_layers > 1 else 0.0
 
-        self.encoder = nn.LSTM(
+        # Separate encoders for actor and critic
+        self.actor_encoder = nn.LSTM(
+            input_size=state_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.critic_encoder = nn.LSTM(
             input_size=state_dim,
             hidden_size=lstm_hidden,
             num_layers=lstm_layers,
@@ -52,7 +61,8 @@ class LSTMActorCritic(nn.Module):
 
         self.use_layer_norm = use_layer_norm
         if use_layer_norm:
-            self.layer_norm = nn.LayerNorm(lstm_hidden)
+            self.actor_layer_norm = nn.LayerNorm(lstm_hidden)
+            self.critic_layer_norm = nn.LayerNorm(lstm_hidden)
 
         act_fn = _get_activation(activation)
 
@@ -70,19 +80,34 @@ class LSTMActorCritic(nn.Module):
 
         self._init_weights()
 
-    def _init_weights(self):
-        for name, param in self.encoder.named_parameters():
+    def _init_lstm_weights(self, encoder: nn.LSTM):
+        for name, param in encoder.named_parameters():
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
             elif "weight_hh" in name:
                 nn.init.orthogonal_(param, gain=1.0)
             elif "bias" in name:
                 nn.init.constant_(param, 0.0)
-        for module in [self.actor, self.critic]:
-            for layer in module:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.constant_(layer.bias, 0.0)
+                if "bias_ih" in name or "bias_hh" in name:
+                    n = self.lstm_hidden
+                    param.data[n : 2 * n].fill_(1.0)
+
+    def _init_weights(self):
+        self._init_lstm_weights(self.actor_encoder)
+        self._init_lstm_weights(self.critic_encoder)
+
+        # Actor: gain=1.5 (large initial logit separation to produce strong
+        # policy gradients through the softmax; prevents collapse to uniform)
+        for layer in self.actor:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1.5)
+                nn.init.constant_(layer.bias, 0.0)
+
+        # Critic: gain=1.0 (let value predictions reflect return scale)
+        for layer in self.critic:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=1.0)
+                nn.init.constant_(layer.bias, 0.0)
 
     def _init_hidden(self, batch_size: int, device: torch.device):
         h0 = torch.zeros(self.lstm_layers, batch_size, self.lstm_hidden, device=device)
@@ -92,14 +117,21 @@ class LSTMActorCritic(nn.Module):
     def forward(self, obs_seq: torch.Tensor, hidden=None):
         batch_size = obs_seq.size(0)
         if hidden is None:
-            hidden = self._init_hidden(batch_size, obs_seq.device)
+            actor_hidden = self._init_hidden(batch_size, obs_seq.device)
+            critic_hidden = self._init_hidden(batch_size, obs_seq.device)
+        else:
+            actor_hidden, critic_hidden = hidden
 
-        enc_out, hidden = self.encoder(obs_seq, hidden)
+        actor_out, actor_hidden = self.actor_encoder(obs_seq, actor_hidden)
+        critic_out, critic_hidden = self.critic_encoder(obs_seq, critic_hidden)
+
         if self.use_layer_norm:
-            enc_out = self.layer_norm(enc_out)
-        action_logits = self.actor(enc_out)
-        values = self.critic(enc_out)
-        return action_logits, values, hidden
+            actor_out = self.actor_layer_norm(actor_out)
+            critic_out = self.critic_layer_norm(critic_out)
+
+        action_logits = self.actor(actor_out)
+        values = self.critic(critic_out)
+        return action_logits, values, (actor_hidden, critic_hidden)
 
     def get_action(self, obs_seq: torch.Tensor, hidden=None, deterministic: bool = False):
         action_logits, values, hidden = self.forward(obs_seq, hidden)
@@ -121,4 +153,5 @@ class LSTMActorCritic(nn.Module):
         return action_logits, log_probs, values.squeeze(-1), entropy, hidden
 
     def get_initial_hidden(self, batch_size: int, device: torch.device):
-        return self._init_hidden(batch_size, device)
+        return (self._init_hidden(batch_size, device),
+                self._init_hidden(batch_size, device))

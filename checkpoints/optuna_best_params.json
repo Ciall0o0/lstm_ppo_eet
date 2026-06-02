@@ -1,0 +1,26 @@
+{
+  "best_value": -0.09792197143236717,
+  "best_params": {
+    "learning_rate": 0.0003699692731291631,
+    "entropy_coef_start": 0.005260376052586533,
+    "entropy_coef_end": 0.0013737926696678134,
+    "entropy_floor": 0.0012146581245280174,
+    "max_grad_norm": 1.2059463836273514,
+    "clip_epsilon": 0.22250049694660842,
+    "value_loss_coef": 0.7710207099882341,
+    "weight_decay": 3.943808796030327e-05,
+    "ppo_epochs": 9,
+    "batch_size": 4096,
+    "seq_len": 64,
+    "kl_target": 0.013150431859524922,
+    "lstm_hidden": 256,
+    "burn_in_steps": 4,
+    "actor_hidden": 64,
+    "critic_hidden": 64,
+    "activation": "relu",
+    "assignment_proximity": -0.5109573114002305,
+    "assignment_direction_align": 2.286696591161166,
+    "assignment_load_balance": -0.6066551964581977,
+    "assignment_estimated_wait": -0.026275494091376382
+  }
+}

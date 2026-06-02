@@ -37,7 +37,8 @@ def main(cfg: dict | None = None):
     seed = cfg.get("data", {}).get("random_seed", 42)
     set_seed(seed)
 
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision('high')
 
     device = get_device()
@@ -90,15 +91,18 @@ def main(cfg: dict | None = None):
     early_stop_patience = training_cfg.get("early_stop_patience", 30)
     num_envs = training_cfg.get("num_envs", 1)
 
-    # LR scheduler with optional warmup
+    # LR scheduler with optional warmup (one per optimizer)
     ppo_cfg = cfg.get("ppo", {})
     lr = ppo_cfg.get("learning_rate", 5e-4)
     warmup_epochs = training_cfg.get("warmup_epochs", 0)
 
-    main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        trainer.optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=lr * 0.1,
+    actor_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        trainer.actor_optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=lr * 0.1,
     )
-    trainer.scheduler = main_scheduler  # attach for save/load
+    critic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        trainer.critic_optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=lr * 0.1,
+    )
+    trainer.scheduler = actor_scheduler  # attach for save/load (actor is primary)
 
     # Resume from checkpoint (after scheduler is created so state can be restored)
     if resume_path:
@@ -113,6 +117,7 @@ def main(cfg: dict | None = None):
     # Entropy annealing params
     entropy_start = ppo_cfg.get("entropy_coef_start", 0.10)
     entropy_end = ppo_cfg.get("entropy_coef_end", 0.01)
+    entropy_floor = ppo_cfg.get("entropy_floor", 0.0)
 
     # Training loop
     best_val_reward = -float("inf")
@@ -122,7 +127,7 @@ def main(cfg: dict | None = None):
     print(f"\n{'='*60}")
     print(f"Starting training: {total_epochs} epochs, {num_envs} parallel envs")
     print(f"LR schedule: {'warmup → ' if warmup_epochs else ''}cosine {lr}→{lr * 0.1:.2e}")
-    print(f"Entropy: {entropy_start}→{entropy_end}")
+    print(f"Entropy: {entropy_start}→{entropy_end} (floor={entropy_floor})")
     print(f"{'='*60}\n")
 
     bar_fmt = "{l_bar}{bar:30}{r_bar}"
@@ -143,12 +148,18 @@ def main(cfg: dict | None = None):
             warmup_ratio = training_cfg.get("warmup_ratio", 0.1)
             progress = (epoch + 1) / max(warmup_epochs, 1)
             warmup_lr = lr * (warmup_ratio + (1.0 - warmup_ratio) * progress)
-            for param_group in trainer.optimizer.param_groups:
+            for param_group in trainer.actor_optimizer.param_groups:
+                param_group['lr'] = warmup_lr
+            for param_group in trainer.critic_optimizer.param_groups:
                 param_group['lr'] = warmup_lr
 
-        # Update entropy coefficient (linear anneal)
-        progress = epoch / max(total_epochs - 1, 1)
-        trainer.set_entropy_coef(entropy_start + (entropy_end - entropy_start) * progress)
+        # Update entropy coefficient (linear anneal with floor guard)
+        # If measured entropy from previous update is below the floor,
+        # freeze the coefficient to prevent further collapse.
+        measured_entropy = trainer.stats.get("entropy", None)
+        if entropy_floor <= 0 or measured_entropy is None or measured_entropy >= entropy_floor:
+            progress = epoch / max(total_epochs - 1, 1)
+            trainer.set_entropy_coef(entropy_start + (entropy_end - entropy_start) * progress)
 
         # Shuffle train indices for this epoch
         epoch_indices = np.random.permutation(train_idx)
@@ -207,7 +218,8 @@ def main(cfg: dict | None = None):
 
         # Step LR scheduler after optimizer updates (avoids PyTorch warning)
         if epoch >= warmup_epochs:
-            main_scheduler.step()
+            actor_scheduler.step()
+            critic_scheduler.step()
 
         # Epoch summary
         avg_epoch_reward = epoch_total_reward / max(epoch_steps, 1)
@@ -215,15 +227,28 @@ def main(cfg: dict | None = None):
         epoch_rewards.append(avg_epoch_reward)
         epoch_time = time.time() - epoch_start
 
+        # Actor weight diagnostics
+        with torch.no_grad():
+            actor_norm = sum(p.norm().item() ** 2 for n, p in trainer.policy.named_parameters()
+                             if "actor" in n and "weight" in n) ** 0.5
+            actor_logit_bias = None
+            for n, p in trainer.policy.named_parameters():
+                if "actor" in n and n.endswith("3.bias"):
+                    actor_logit_bias = p.detach().cpu().tolist()
+                    break
+
         ppo_info = ""
         if trainer.stats:
             ppo_info = (f" | PPO: policy_loss={trainer.stats['policy_loss']:.4e} "
                         f"value_loss={trainer.stats['value_loss']:.4f} "
-                        f"entropy={trainer.stats['entropy']:.4f}")
+                        f"entropy={trainer.stats['entropy']:.4f} "
+                        f"adv[μ={trainer.stats.get('adv_mean',0):.3f} σ={trainer.stats.get('adv_std',0):.3f} "
+                        f"+%={trainer.stats.get('adv_frac_pos',0.5):.2f}]")
+        bias_str = f" | logit_bias={actor_logit_bias}" if actor_logit_bias else ""
         epoch_bar.write(
             f"Epoch {epoch+1:>3d} done | Time {epoch_time:.1f}s | "
             f"Episodes {n_episodes} | AvgR/step {avg_epoch_reward:.4f} | "
-            f"AvgR/ep {avg_episode_reward:.1f}{ppo_info}"
+            f"AvgR/ep {avg_episode_reward:.1f} | actor_w={actor_norm:.4f}{bias_str}{ppo_info}"
         )
 
         # SwanLab logging
@@ -243,27 +268,38 @@ def main(cfg: dict | None = None):
                 "ppo/value_loss": trainer.stats["value_loss"],
                 "ppo/entropy": trainer.stats["entropy"],
                 "ppo/n_updates": trainer.stats["n_updates"],
-                "ppo/grad_norm": trainer.stats.get("grad_norm", 0.0),
+                "ppo/actor_grad_norm": trainer.stats.get("actor_grad_norm", 0.0),
+                "ppo/critic_grad_norm": trainer.stats.get("critic_grad_norm", 0.0),
                 "ppo/approx_kl": trainer.stats.get("approx_kl", 0.0),
                 "ppo/clip_frac": trainer.stats.get("clip_frac", 0.0),
                 "ppo/explained_var": trainer.stats.get("explained_var", 0.0),
                 "ppo/value_pred_error": trainer.stats.get("value_pred_error", 0.0),
+                "ppo/adv_mean": trainer.stats.get("adv_mean", 0.0),
+                "ppo/adv_std": trainer.stats.get("adv_std", 0.0),
+                "ppo/adv_frac_pos": trainer.stats.get("adv_frac_pos", 0.5),
             })
         swanlab.log(swanlab_log, step=epoch)
 
         # Validation
         if (epoch + 1) % eval_every == 0:
-            val_reward = validate(trainer, env_template, event_seqs, event_lens, val_idx)
+            val_reward, val_diag = validate(trainer, env_template, event_seqs, event_lens, val_idx)
             val_rewards.append(val_reward)
-            epoch_bar.write(f"  Validation avg reward: {val_reward:.4f}")
+            ap = val_diag["action_probs"]
+            epoch_bar.write(
+                f"  Validation avg reward: {val_reward:.4f} | "
+                f"actions: [{ap[0]:.2f} {ap[1]:.2f} {ap[2]:.2f}] | "
+                f"steps: {val_diag['total_steps']}"
+            )
+            if val_diag["sample_logits"]:
+                epoch_bar.write(f"  Sample logits: {val_diag['sample_logits'][0]}")
             swanlab.log({"val/avg_reward": val_reward}, step=epoch)
 
             # Per-scenario validation logging
             if len(val_by_scenario) > 1:
                 scenario_rewards = {}
                 for lbl, idxs in val_by_scenario.items():
-                    sr = validate(trainer, env_template, event_seqs, event_lens,
-                                  np.array(idxs, dtype=np.int64), quiet=True)
+                    sr, _ = validate(trainer, env_template, event_seqs, event_lens,
+                                     np.array(idxs, dtype=np.int64), quiet=True)
                     scenario_rewards[f"val/scenario_{SCENARIO_LABELS.get(lbl, lbl)}_reward"] = sr
                 swanlab.log(scenario_rewards, step=epoch)
 
@@ -294,11 +330,13 @@ def main(cfg: dict | None = None):
 
 def validate(trainer: PPOTrainer, env: ElevatorEnv,
              event_seqs: np.ndarray, event_lens: np.ndarray,
-             val_idx: np.ndarray, quiet: bool = False) -> float:
-    """Evaluate on validation set, return average reward."""
+             val_idx: np.ndarray, quiet: bool = False) -> tuple[float, dict]:
+    """Evaluate on validation set, return (avg_reward, diagnostics)."""
     trainer.policy.eval()
     total_reward = 0.0
     total_steps = 0
+    action_counts = [0] * env.action_space.n
+    all_logits: list[list[float]] = []
 
     policy = trainer.policy
     _obs_gpu = torch.empty(env.STATE_DIM, dtype=torch.float32, device=trainer.device)
@@ -325,12 +363,25 @@ def validate(trainer: PPOTrainer, env: ElevatorEnv,
                 action, _, _, hidden = policy.get_action(
                     obs_seq, hidden=hidden, deterministic=True
                 )
-                obs, reward, done, _, _ = env.step(int(action.item()))  # type: ignore[arg-type]
+                action_int = int(action.item())
+                action_counts[action_int] += 1
+                # Log first few logits per episode for diagnosis
+                if len(all_logits) < 3 and total_steps < 5:
+                    with torch.no_grad():
+                        logits, _, _ = policy.forward(obs_seq, hidden=hidden)
+                        all_logits.append(logits.detach().cpu().squeeze().tolist())
+                obs, reward, done, _, _ = env.step(action_int)  # type: ignore[arg-type]
                 total_reward += reward
                 total_steps += 1
 
     policy.train()
-    return total_reward / max(total_steps, 1)
+    diag = {
+        "action_counts": action_counts,
+        "action_probs": [c / max(total_steps, 1) for c in action_counts],
+        "sample_logits": all_logits,
+        "total_steps": total_steps,
+    }
+    return total_reward / max(total_steps, 1), diag
 
 
 def plot_training_curve(epoch_rewards: list[float], val_rewards: list[float],

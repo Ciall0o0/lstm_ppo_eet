@@ -16,3 +16,7 @@ wheels/
 4层间交互客流
 5极端闲时
 requirement
+.claudes
+*.log
+swanlog/
+fill_report.py
