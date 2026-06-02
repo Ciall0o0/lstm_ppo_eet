@@ -38,8 +38,9 @@ eet/
 │   └── plc/
 │       ├── snap7_client.py    # PLC 通信客户端（读/写 DB/IQ 区域）
 │       └── bridge.py          # PLC↔推理桥接（主循环：读状态→推理→写指令）
-├── checkpoints/                # 模型检查点 + Optuna 结果 + 评估图表
+├── checkpoints/               # 模型检查点 + Optuna 结果 + 评估图表
 ├── main.py                    # 管道编排：Optuna → Train → Evaluate
+|── monitor.py                 # 训练进度监控与异常检测
 ├── apply_best_params.py       # 将 Optuna 最佳参数写入 config.yaml
 ├── eet_parser.py              # .eet 二进制文件解析器
 └── eet_dataset.py             # 从 .eet 提取训练数据集
@@ -159,6 +160,8 @@ uv run python monitor.py watch
 - Value loss 反复飙升 >200
 - NaN/Inf 出现
 - Advantage 均值持续异常
+
+也推荐使用[swanlab](https://swanlab.cn/home)进行监控
 
 ### 6. 评估模型
 
