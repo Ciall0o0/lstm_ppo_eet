@@ -161,7 +161,7 @@ uv run python monitor.py watch
 - NaN/Inf 出现
 - Advantage 均值持续异常
 
-也推荐使用[swanlab](https://swanlab.cn/home)进行监控
+也推荐使用[swanlab](https://swanlab.cn/home)进行监控，我的训练结果在[https://swanlab.cn/@Ciallooooo/elevator-scheduling/overview](https://swanlab.cn/@Ciallooooo/elevator-scheduling/overview)]
 
 ### 6. 评估模型
 
