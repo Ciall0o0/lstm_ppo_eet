@@ -41,8 +41,6 @@ eet/
 ├── checkpoints/                # 模型检查点 + Optuna 结果 + 评估图表
 ├── main.py                    # 管道编排：Optuna → Train → Evaluate
 ├── apply_best_params.py       # 将 Optuna 最佳参数写入 config.yaml
-├── monitor.py                 # 训练进度监控与异常检测
-├── fill_report.py             # 学术报告自动生成（python-docx）
 ├── eet_parser.py              # .eet 二进制文件解析器
 └── eet_dataset.py             # 从 .eet 提取训练数据集
 ```
