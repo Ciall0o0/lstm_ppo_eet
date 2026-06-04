@@ -13,6 +13,7 @@ import logging
 from typing import Literal
 
 import snap7
+from snap7.type import Parameter
 from snap7.util import get_bool, set_bool, get_word, set_word
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,10 @@ class PLCClient:
             self._client = snap7.client.Client()
             tsap = (self.rack << 8) | self.slot
             self._client.set_connection_params(self.ip, tsap, tsap)
-            self._client.set_timeout(self.timeout_ms)
+            # snap7 v3.x uses set_param instead of set_timeout
+            self._client.set_param(Parameter.PingTimeout, self.timeout_ms)
+            self._client.set_param(Parameter.SendTimeout, self.timeout_ms)
+            self._client.set_param(Parameter.RecvTimeout, self.timeout_ms)
             self._client.connect(self.ip, self.rack, self.slot)
             logger.info(f"Connected to PLC at {self.ip} (rack={self.rack}, slot={self.slot})")
             return True
@@ -250,14 +254,14 @@ class ElevatorPLCInterface:
     def read_elevator_state(self, elevator_id: int) -> dict:
         """Read complete state for one elevator (triggers PLC read)."""
         data = self.read_all_inputs()
-        return self._parse_elevator_state(elevator_id, data)
+        return self.parse_elevator_state(elevator_id, data)
 
     def read_all_elevator_states(self) -> list[dict]:
         """Read all elevator states in a single PLC round-trip."""
         data = self.read_all_inputs()
-        return [self._parse_elevator_state(i, data) for i in range(self.NUM_ELEVATORS)]
+        return [self.parse_elevator_state(i, data) for i in range(self.NUM_ELEVATORS)]
 
-    def _parse_elevator_state(self, elevator_id: int, data: bytearray) -> dict:
+    def parse_elevator_state(self, elevator_id: int, data: bytearray) -> dict:
         """Parse elevator state from pre-read DB10 data."""
         inputs = self.parse_elevator_inputs(elevator_id, data)
         load_ratio = self.parse_load_weight(elevator_id, data)

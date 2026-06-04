@@ -44,6 +44,7 @@ class PLCInferenceBridge:
         self.running = False
         self._decision_log: deque[dict] = deque(maxlen=1000)
         self._stats: dict = {"decisions": 0, "errors": 0, "last_decision_time": 0.0}
+        self._last_floors: list[int] = [1] * ElevatorPLCInterface.NUM_ELEVATORS
 
     def connect(self) -> bool:
         ok = self.client.connect()
@@ -94,8 +95,9 @@ class PLCInferenceBridge:
         elevators = []
         for el_id in range(ElevatorPLCInterface.NUM_ELEVATORS):
             try:
-                state = self.interface._parse_elevator_state(el_id, data)
+                state = self.interface.parse_elevator_state(el_id, data)
                 elevators.append(state)
+                self._last_floors[el_id] = state["floor"]
             except Exception:
                 elevators.append({
                     "floor": 1, "direction": 0, "load_ratio": 0.0,
@@ -165,6 +167,10 @@ class PLCInferenceBridge:
 
     def get_recent_decisions(self, n: int = 20) -> list[dict]:
         return list(self._decision_log)[-n:]
+
+    def get_elevator_floors(self) -> list[int]:
+        """Return last known floor positions (thread-safe snapshot)."""
+        return list(self._last_floors)
 
 
 if __name__ == "__main__":

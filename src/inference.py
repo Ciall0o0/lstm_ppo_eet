@@ -82,14 +82,15 @@ class ElevatorScheduler:
     def _build_obs(self, state_dict: dict) -> np.ndarray:
         """Convert structured PLC state dict to flat observation vector.
 
-        Produces 104-dim vector matching ElevatorEnv._get_obs():
+        Produces 109-dim vector matching ElevatorEnv._get_obs():
           Per elevator (20 dims): floor_1hot(10) + dir_1hot(3) + load_ratio(1)
                                   + is_moving(1) + door_open(1) + has_car_calls(1)
                                   + passenger_load_ratio(1) + target_floor(1) + dist_to_oldest(1)
-          Global (44 dims): up_calls(10) + down_calls(10) + up_dest(10) + down_dest(10)
+          Global (49 dims): up_calls(10) + down_calls(10) + up_dest(10) + down_dest(10)
                             + elapsed(1) + n_pending(1) + time_delta(1) + floor_delta(1)
-        Note: passenger_load_ratio, target_floor, dist_to_oldest, and call destinations
-              are unavailable from PLC — padded with zeros.
+                            + event_progress(1) + mean_time_delta(1) + max_time_delta(1)
+                            + mean_floor_delta(1) + est_wait(1)
+        Note: features unavailable from PLC are padded with zeros.
         """
         elevators = state_dict.get("elevators", [])
         floor_up_calls = state_dict.get("floor_up_calls", [False] * MAX_FLOOR)
@@ -132,19 +133,28 @@ class ElevatorScheduler:
         up_dest_vec = np.zeros(MAX_FLOOR, dtype=np.float32)
         down_dest_vec = np.zeros(MAX_FLOOR, dtype=np.float32)
 
-        # Global features (4 dims)
+        # Global features (9 dims matching ElevatorEnv._get_obs)
         n_active = int(sum(floor_up_calls) + sum(floor_down_calls))
         seq_progress = min(len(self._history) / max(self._history.maxlen, 1), 1.0)
         global_vec = np.array([
-            seq_progress,                           # elapsed / max_time
-            min(n_active / self._max_calls_norm, 1.0),  # n_pending
-            0.0,  # time_delta (unavailable from PLC)
-            0.0,  # floor_delta (unavailable from PLC)
+            seq_progress,                                    # elapsed / max_time
+            min(n_active / self._max_calls_norm, 1.0),       # n_pending
+            0.0,                                             # time_delta
+            0.0,                                             # floor_delta
+            0.0,                                             # event_progress
+            0.0,                                             # mean_time_delta
+            0.0,                                             # max_time_delta
+            0.0,                                             # mean_floor_delta
+            0.0,                                             # est_wait
         ], dtype=np.float32)
 
-        return np.concatenate(
+        obs = np.concatenate(
             elems + [up_vec, down_vec, up_dest_vec, down_dest_vec, global_vec]
         )
+        assert obs.shape[0] == self.state_dim, (
+            f"Observation dimension mismatch: got {obs.shape[0]}, expected {self.state_dim}"
+        )
+        return obs
 
     def get_action_probs(self, state_dict: dict) -> dict[int, float]:
         """Return action probabilities for all elevators (useful for diagnostics)."""
